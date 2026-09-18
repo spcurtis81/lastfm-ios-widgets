@@ -2,25 +2,27 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: deep-gray; icon-glyph: magic;
 // Last.fm Decade History Collector
-// Experimental development version v0.6
+// Experimental development version v0.7
 //
 // SAFE / GENTLE COLLECTOR
 // ------------------------------------------------------------
 //
 // Absolute maximum Last.fm HTTP requests per execution: 1
 //
-// v0.6 architecture:
-//   - Username-scoped local storage
-//   - Cache schema v2
+// v0.7 architecture:
+//   - Username-scoped local storage (schema v2)
+//   - Automatic collection-range discovery via user.getInfo
+//   - Account metadata cached so later runs do not repeat getInfo
 //   - Conservative import of matching v0.5/v1 cache data
 //   - Captured/unparsable years do not block other years
 //   - Chronological collection queue
 //
+// user.getInfo and annual-report HTML are mutually exclusive:
+// a setup run may look up the account, or a later run may fetch
+// one report — never both in the same execution.
+//
 // This is still a manual Scriptable collector.
 // It does not create a Home Screen widget.
-//
-// Temporary development year bounds (CONFIG.firstYear / lastYear)
-// remain until automatic range discovery is implemented.
 
 
 const SCHEMA_VERSION = 2
@@ -28,14 +30,20 @@ const SCHEMA_VERSION = 2
 // Increment when parsers change so captured HTML can be reparsed once.
 const PARSER_GENERATION = 1
 
+// Earliest annual-report year this collector will attempt.
+// Years before this floor are never probed over the network.
+const REPORT_FLOOR_YEAR = 2016
+
+const USER_AGENT =
+  "lastfm-ios-widgets/0.7 (Scriptable; GitHub spcurtis81/lastfm-ios-widgets)"
+
+const USERNAME_PLACEHOLDER = "YOUR_LASTFM_USERNAME"
+const API_KEY_PLACEHOLDER = "YOUR_LASTFM_API_KEY"
+
 
 const CONFIG = {
   username: "YOUR_LASTFM_USERNAME",
-
-  // TEMPORARY development bounds. Do not treat as Last.fm product limits.
-  // Automatic account-range discovery is intentionally not in v0.6.
-  firstYear: 2006,
-  lastYear: 2025,
+  apiKey: "YOUR_LASTFM_API_KEY",
 
   cacheRootDirectory: "LastFMDecadeHistory",
   usersDirectory: "users",
@@ -44,6 +52,9 @@ const CONFIG = {
 
   legacyCacheFile: "decade-history-v1.json"
 }
+
+// Optional test clock. Ordinary Scriptable runs leave this null.
+let nowOverrideMs = null
 
 
 // ============================================================
@@ -186,14 +197,100 @@ function yearKey(year) {
 }
 
 
-function yearsInRange() {
+function setNowMs(value) {
+  nowOverrideMs = value
+}
+
+
+function nowMs() {
+  return nowOverrideMs == null ? Date.now() : nowOverrideMs
+}
+
+
+function currentCalendarYear() {
+  return new Date(nowMs()).getFullYear()
+}
+
+
+function configurationError() {
+  const username = String(CONFIG.username ?? "").trim()
+  const apiKey = String(CONFIG.apiKey ?? "").trim()
+
+  if (!username || username === USERNAME_PLACEHOLDER) {
+    return "Add your Last.fm username in CONFIG before running this collector."
+  }
+
+  if (!apiKey || apiKey === API_KEY_PLACEHOLDER) {
+    return "Add your Last.fm API key in CONFIG before running this collector."
+  }
+
+  return null
+}
+
+
+function hasAccountMetadata(cache) {
+  const account = cache?.account
+
+  if (!account || typeof account !== "object") {
+    return false
+  }
+
+  const registeredAt = Number(account.registeredAt)
+  const registeredYear = Number(account.registeredYear)
+
+  return (
+    Number.isFinite(registeredAt) &&
+    registeredAt > 0 &&
+    Number.isFinite(registeredYear) &&
+    registeredYear >= 2000 &&
+    registeredYear <= currentCalendarYear()
+  )
+}
+
+
+function collectionRange(account) {
+  if (!account || !Number.isFinite(Number(account.registeredYear))) {
+    return {
+      ready: false,
+      empty: true,
+      firstYear: null,
+      lastYear: null,
+      years: []
+    }
+  }
+
+  const registeredYear = Number(account.registeredYear)
+  const firstYear = Math.max(REPORT_FLOOR_YEAR, registeredYear)
+  const lastYear = currentCalendarYear() - 1
+
+  if (firstYear > lastYear) {
+    return {
+      ready: true,
+      empty: true,
+      firstYear,
+      lastYear,
+      years: []
+    }
+  }
+
   const years = []
 
-  for (let year = CONFIG.firstYear; year <= CONFIG.lastYear; year += 1) {
+  for (let year = firstYear; year <= lastYear; year += 1) {
     years.push(year)
   }
 
-  return years
+  return {
+    ready: true,
+    empty: false,
+    firstYear,
+    lastYear,
+    years
+  }
+}
+
+
+function yearsInRange(cache) {
+  return collectionRange(cache?.account).years
 }
 
 
@@ -350,6 +447,22 @@ function saveCache(cache) {
 
   if (cache.migratedAt) {
     persisted.migratedAt = cache.migratedAt
+  }
+
+  if (cache.account && typeof cache.account === "object") {
+    persisted.account = {
+      registeredAt: Number(cache.account.registeredAt),
+      registeredYear: Number(cache.account.registeredYear),
+      reportFloorYear: REPORT_FLOOR_YEAR,
+      firstReportYear: Number(
+        cache.account.firstReportYear ??
+          Math.max(
+            REPORT_FLOOR_YEAR,
+            Number(cache.account.registeredYear)
+          )
+      ),
+      discoveredAt: Number(cache.account.discoveredAt || Date.now())
+    }
   }
 
   fm.writeString(
@@ -990,13 +1103,13 @@ function needsNetwork(cache, year) {
 
 
 function chooseTarget(cache) {
-  for (const year of yearsInRange()) {
+  for (const year of yearsInRange(cache)) {
     if (needsLocalParse(cache, year)) {
       return { year, kind: "local-parse" }
     }
   }
 
-  for (const year of yearsInRange()) {
+  for (const year of yearsInRange(cache)) {
     if (needsNetwork(cache, year)) {
       return { year, kind: "network" }
     }
@@ -1007,7 +1120,7 @@ function chooseTarget(cache) {
 
 
 function collectionProgress(cache) {
-  const years = yearsInRange()
+  const years = yearsInRange(cache)
   let available = 0
   let unavailable = 0
   let captured = 0
@@ -1045,9 +1158,20 @@ function countLabel(count, singular, plural) {
 
 function progressMessage(cache) {
   const progress = collectionProgress(cache)
+  const range = collectionRange(cache?.account)
+
+  if (range.ready && range.empty) {
+    return (
+      "No completed annual reports are available to collect yet.\n" +
+      `This Last.fm account was created in ${cache.account.registeredYear}.`
+    )
+  }
 
   return (
     `${progress.available} of ${progress.total} years collected` +
+    (range.ready
+      ? ` (${range.firstYear}–${range.lastYear})`
+      : "") +
     (progress.captured
       ? `\n${countLabel(progress.captured, "report needs parsing", "reports need parsing")}`
       : "") +
@@ -1063,9 +1187,20 @@ function progressMessage(cache) {
 
 function idleStatus(cache) {
   const progress = collectionProgress(cache)
+  const range = collectionRange(cache?.account)
   const unresolved =
     progress.captured + progress.transient + progress.remaining
   const body = progressMessage(cache)
+
+  if (range.ready && range.empty) {
+    return {
+      complete: true,
+      title: "No reports to collect yet",
+      message:
+        body +
+        "\n\nThis is expected when the account is newer than last year’s completed reports. Try again next year."
+    }
+  }
 
   if (unresolved === 0) {
     return {
@@ -1088,13 +1223,247 @@ function idleStatus(cache) {
 
 
 // ============================================================
-// NETWORK — the only Request path
+// NETWORK
+//
+// Two Request constructors exist. Control flow guarantees they
+// are mutually exclusive within one execution:
+//   A. fetchUserInfo  — official API, setup only
+//   B. fetchReport    — annual-report HTML, collector only
+// Maximum external HTTP requests per execution: 1
 // ============================================================
+
+function userInfoURL() {
+  return (
+    "https://ws.audioscrobbler.com/2.0/" +
+    "?method=user.getinfo" +
+    "&user=" +
+    encodeURIComponent(CONFIG.username) +
+    "&api_key=" +
+    encodeURIComponent(CONFIG.apiKey) +
+    "&format=json"
+  )
+}
+
+
+function redactRequestURL(url) {
+  return String(url).replace(/api_key=[^&]*/i, "api_key=REDACTED")
+}
+
+
+function coerceUnixTimestamp(value) {
+  if (value == null || value === "") {
+    return null
+  }
+
+  if (typeof value === "object") {
+    return null
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim()
+
+    if (/^\d+(\.\d+)?$/.test(trimmed)) {
+      value = Number(trimmed)
+    } else {
+      const parsed = Date.parse(trimmed.replace(" ", "T") + "Z")
+
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return Math.floor(parsed / 1000)
+      }
+
+      return null
+    }
+  }
+
+  const number = Number(value)
+
+  if (!Number.isFinite(number) || number <= 0) {
+    return null
+  }
+
+  if (number > 1e12) {
+    return Math.floor(number / 1000)
+  }
+
+  if (number >= 1e8) {
+    return Math.floor(number)
+  }
+
+  return null
+}
+
+
+function extractRegisteredUnix(payload) {
+  const user = payload?.user
+
+  if (!user || typeof user !== "object") {
+    return null
+  }
+
+  const registered = user.registered
+  const candidates = []
+
+  if (registered && typeof registered === "object") {
+    candidates.push(
+      registered.unixtime,
+      registered.uts,
+      registered["#text"],
+      registered.text
+    )
+  } else {
+    candidates.push(registered)
+  }
+
+  candidates.push(user.registered_unixtime, user.unixtime)
+
+  for (const candidate of candidates) {
+    const unix = coerceUnixTimestamp(candidate)
+
+    if (unix) {
+      return unix
+    }
+  }
+
+  return null
+}
+
+
+function apiErrorMessage(code, message) {
+  if (code === 10) {
+    return "The Last.fm API key is not valid."
+  }
+
+  if (code === 6) {
+    return "That Last.fm username could not be found."
+  }
+
+  if (code === 29) {
+    return "Last.fm is temporarily limiting requests. Try again later."
+  }
+
+  if (code === 11 || code === 16) {
+    return "Last.fm is temporarily unavailable. Try again later."
+  }
+
+  return (
+    "Last.fm could not look up this account" +
+    (message ? ` (${message})` : "") +
+    "."
+  )
+}
+
+
+function interpretUserInfo(payload, httpStatus) {
+  if (!payload || typeof payload !== "object") {
+    return {
+      ok: false,
+      kind: "malformed",
+      message: "Last.fm did not return a usable account response."
+    }
+  }
+
+  if (payload.error != null) {
+    const code = Number(payload.error)
+
+    return {
+      ok: false,
+      kind: "api-error",
+      code,
+      httpStatus,
+      message: apiErrorMessage(code, payload.message)
+    }
+  }
+
+  const registeredAt = extractRegisteredUnix(payload)
+
+  if (!registeredAt) {
+    return {
+      ok: false,
+      kind: "malformed",
+      message: "Last.fm did not return a usable account registration date."
+    }
+  }
+
+  const registeredYear = new Date(registeredAt * 1000).getUTCFullYear()
+
+  if (
+    !Number.isFinite(registeredYear) ||
+    registeredYear < 2000 ||
+    registeredYear > currentCalendarYear()
+  ) {
+    return {
+      ok: false,
+      kind: "malformed",
+      message: "Last.fm did not return a usable account registration date."
+    }
+  }
+
+  const firstReportYear = Math.max(REPORT_FLOOR_YEAR, registeredYear)
+
+  return {
+    ok: true,
+    account: {
+      registeredAt,
+      registeredYear,
+      reportFloorYear: REPORT_FLOOR_YEAR,
+      firstReportYear,
+      discoveredAt: Date.now()
+    }
+  }
+}
+
+
+async function fetchUserInfo() {
+  const url = userInfoURL()
+
+  console.log("NETWORK REQUEST (user.getInfo)")
+  console.log(redactRequestURL(url))
+
+  const request = new Request(url)
+  request.timeoutInterval = 30
+  request.headers = {
+    "User-Agent": USER_AGENT
+  }
+
+  try {
+    const payload = await request.loadJSON()
+    const status = Number(request.response?.statusCode || 0)
+
+    return interpretUserInfo(payload, status)
+  } catch (error) {
+    return {
+      ok: false,
+      kind: "network",
+      message:
+        "Could not reach Last.fm to look up this account.\n\n" +
+        String(error?.message || error)
+    }
+  }
+}
+
+
+function setupRangeMessage(account) {
+  const range = collectionRange(account)
+
+  if (range.empty) {
+    return (
+      `This Last.fm account was created in ${account.registeredYear}.\n\n` +
+      "There are no completed annual listening reports to collect yet. " +
+      "This is normal for a new account. Try again next year."
+    )
+  }
+
+  return (
+    `Collecting annual reports from ${range.firstYear} to ${range.lastYear}.\n\n` +
+    "The account was looked up once. Later runs will collect one year at a time."
+  )
+}
+
 
 async function fetchReport(year) {
   const url = reportURL(year)
 
-  console.log("NETWORK REQUEST")
+  console.log("NETWORK REQUEST (annual report)")
   console.log(url)
 
   const request = new Request(url)
@@ -1159,11 +1528,27 @@ async function presentAlert(title, message) {
 // ============================================================
 
 async function runCollector() {
+  const configProblem = configurationError()
+
+  if (configProblem) {
+    await presentAlert("Configuration needed", configProblem)
+
+    if (typeof Script !== "undefined") {
+      Script.complete()
+    }
+
+    return {
+      ok: false,
+      configurationError: true,
+      message: configProblem
+    }
+  }
+
   const cache = loadCache()
 
   console.log("")
   console.log("========================================")
-  console.log("LAST.FM DECADE COLLECTOR v0.6")
+  console.log("LAST.FM DECADE COLLECTOR v0.7")
   console.log("========================================")
   console.log(`User: ${CONFIG.username}`)
   console.log("Maximum network requests this run: 1")
@@ -1178,6 +1563,41 @@ async function runCollector() {
 
   if (cache.migration?.imported) {
     console.log("Imported matching previous collector data.")
+  }
+
+  if (!hasAccountMetadata(cache)) {
+    const discovery = await fetchUserInfo()
+
+    if (!discovery.ok) {
+      await presentAlert(
+        "Account lookup failed",
+        discovery.message +
+          "\n\nSaved listening history was left unchanged. Try again later."
+      )
+
+      if (typeof Script !== "undefined") {
+        Script.complete()
+      }
+
+      cache.discovery = discovery
+      return cache
+    }
+
+    cache.account = discovery.account
+    saveCache(cache)
+
+    printCacheSummary(cache)
+
+    await presentAlert(
+      "Collection range ready",
+      setupRangeMessage(cache.account)
+    )
+
+    if (typeof Script !== "undefined") {
+      Script.complete()
+    }
+
+    return cache
   }
 
   printCacheSummary(cache)
@@ -1344,6 +1764,10 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     SCHEMA_VERSION,
     PARSER_GENERATION,
+    REPORT_FLOOR_YEAR,
+    USER_AGENT,
+    USERNAME_PLACEHOLDER,
+    API_KEY_PLACEHOLDER,
     CONFIG,
     userStorageKey,
     userDirectoryPath,
@@ -1359,9 +1783,15 @@ if (typeof module !== "undefined" && module.exports) {
     needsLocalParse,
     needsNetwork,
     yearsInRange,
+    collectionRange,
     collectionProgress,
     progressMessage,
     idleStatus,
+    hasAccountMetadata,
+    configurationError,
+    userInfoURL,
+    interpretUserInfo,
+    extractRegisteredUnix,
     importYearFromLegacy,
     migrateMatchingLegacyCache,
     loadCache,
@@ -1369,6 +1799,10 @@ if (typeof module !== "undefined" && module.exports) {
     trySavedReport,
     markCapturedParsePending,
     runCollector,
+    fetchUserInfo,
+    fetchReport,
+    setNowMs,
+    currentCalendarYear,
     fnv1aHex
   }
 }
