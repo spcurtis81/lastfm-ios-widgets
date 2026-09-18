@@ -16,6 +16,14 @@
 //   - Conservative import of matching v0.5/v1 cache data
 //   - Captured/unparsable years do not block other years
 //   - Chronological collection queue
+//   - Conservative annual-report retry/backoff
+//
+// Year states:
+//   available            — parsed and validated
+//   captured             — HTML saved, parse pending or failed
+//   unavailable          — historical year confirmed missing (404)
+//   transient            — transport/temporary failure; backoff applies
+//   pending-publication  — newest completed year returned 404; 7-day retry
 //
 // user.getInfo and annual-report HTML are mutually exclusive:
 // a setup run may look up the account, or a later run may fetch
@@ -39,6 +47,12 @@ const USER_AGENT =
 
 const USERNAME_PLACEHOLDER = "YOUR_LASTFM_USERNAME"
 const API_KEY_PLACEHOLDER = "YOUR_LASTFM_API_KEY"
+
+const HOUR_MS = 60 * 60 * 1000
+const DAY_MS = 24 * HOUR_MS
+
+// failure #1 -> 6h, #2 -> 24h, #3 -> 3d, #4+ -> 7d
+const PENDING_PUBLICATION_RETRY_MS = 7 * DAY_MS
 
 
 const CONFIG = {
@@ -209,6 +223,54 @@ function nowMs() {
 
 function currentCalendarYear() {
   return new Date(nowMs()).getFullYear()
+}
+
+
+function delayMsForFailureCount(failureCount) {
+  const count = Number(failureCount) || 0
+
+  if (count <= 0) {
+    return 0
+  }
+
+  if (count === 1) {
+    return 6 * HOUR_MS
+  }
+
+  if (count === 2) {
+    return 24 * HOUR_MS
+  }
+
+  if (count === 3) {
+    return 3 * DAY_MS
+  }
+
+  return 7 * DAY_MS
+}
+
+
+function retryAfterMs(record) {
+  if (!record) {
+    return 0
+  }
+
+  const lastTriedAt = Number(record.lastTriedAt)
+
+  if (!Number.isFinite(lastTriedAt) || lastTriedAt <= 0) {
+    return 0
+  }
+
+  const delay =
+    record.status === "pending-publication"
+      ? PENDING_PUBLICATION_RETRY_MS
+      : delayMsForFailureCount(record.failureCount)
+
+  return lastTriedAt + delay
+}
+
+
+function isRetryEligible(record) {
+  return nowMs() >= retryAfterMs(record)
 }
 
 
@@ -949,11 +1011,12 @@ function storeParsedYear(cache, year, parsed, source) {
     classified: validation.total,
     source,
     rawSaved: hasRawReport(year),
-    parsedAt: Date.now(),
-    updatedAt: Date.now(),
+    parsedAt: nowMs(),
+    updatedAt: nowMs(),
     parseGeneration: PARSER_GENERATION,
     failureCount: 0,
-    lastFailureStatus: null
+    lastFailureStatus: null,
+    lastTriedAt: nowMs()
   })
 
   saveCache(cache)
@@ -970,8 +1033,10 @@ function markCapturedParsePending(cache, year, extra = {}) {
     status: "captured",
     rawSaved: hasRawReport(year),
     parseGeneration: PARSER_GENERATION,
-    lastTriedAt: Date.now(),
-    updatedAt: Date.now(),
+    lastTriedAt: nowMs(),
+    updatedAt: nowMs(),
+    failureCount: 0,
+    lastFailureStatus: null,
     ...extra
   })
 
@@ -986,9 +1051,9 @@ function markUnavailable(cache, year, httpStatus) {
     ...existing,
     status: "unavailable",
     httpStatus,
-    checkedAt: Date.now(),
-    lastTriedAt: Date.now(),
-    updatedAt: Date.now(),
+    checkedAt: nowMs(),
+    lastTriedAt: nowMs(),
+    updatedAt: nowMs(),
     rawSaved: false
   })
 
@@ -1003,10 +1068,30 @@ function markTransient(cache, year, httpStatus) {
     ...existing,
     status: "transient",
     httpStatus,
-    lastTriedAt: Date.now(),
+    lastTriedAt: nowMs(),
     lastFailureStatus: httpStatus,
     failureCount: Number(existing.failureCount || 0) + 1,
-    updatedAt: Date.now()
+    updatedAt: nowMs(),
+    rawSaved: hasRawReport(year)
+  })
+
+  saveCache(cache)
+}
+
+
+function markPendingPublication(cache, year, httpStatus) {
+  const existing = cache.years[yearKey(year)] || {}
+
+  cache.years[yearKey(year)] = createYearRecord(year, {
+    ...existing,
+    status: "pending-publication",
+    httpStatus,
+    checkedAt: nowMs(),
+    lastTriedAt: nowMs(),
+    lastFailureStatus: httpStatus,
+    failureCount: Number(existing.failureCount || 0) + 1,
+    updatedAt: nowMs(),
+    rawSaved: false
   })
 
   saveCache(cache)
@@ -1057,10 +1142,14 @@ function trySavedReport(cache, year) {
 // ============================================================
 // TARGET SELECTION
 //
-// Local parse work is separate from network collection.
-// A captured year is attempted at most once per parser generation.
-// It never causes another download of that year.
-// It does not monopolise later runs after that parse attempt.
+// 1. Local parse: saved HTML not yet attempted in this parser generation.
+// 2. Network, chronological, skipping cooling-down years:
+//      missing years
+//      transient whose backoff has elapsed
+//      captured with genuinely missing HTML whose backoff has elapsed
+//      pending-publication whose 7-day wait has elapsed
+// A cooling-down earlier year never blocks a later eligible year.
+// Existing local HTML is never re-downloaded.
 // ============================================================
 
 function needsLocalParse(cache, year) {
@@ -1088,14 +1177,18 @@ function needsNetwork(cache, year) {
   }
 
   const status = yearStatus(cache, year)
+  const record = cache.years?.[yearKey(year)]
 
-  if (
-    status === "available" ||
-    status === "unavailable" ||
-    status === "captured" ||
-    status === "transient"
-  ) {
+  if (status === "available" || status === "unavailable") {
     return false
+  }
+
+  if (status === "captured") {
+    return isRetryEligible(record)
+  }
+
+  if (status === "transient" || status === "pending-publication") {
+    return isRetryEligible(record)
   }
 
   return true
@@ -1125,6 +1218,7 @@ function collectionProgress(cache) {
   let unavailable = 0
   let captured = 0
   let transient = 0
+  let pendingPublication = 0
 
   for (const year of years) {
     const status = yearStatus(cache, year)
@@ -1134,9 +1228,15 @@ function collectionProgress(cache) {
     } else if (status === "unavailable") {
       unavailable += 1
     } else if (status === "captured") {
-      captured += 1
+      if (hasRawReport(year)) {
+        captured += 1
+      } else {
+        transient += 1
+      }
     } else if (status === "transient") {
       transient += 1
+    } else if (status === "pending-publication") {
+      pendingPublication += 1
     }
   }
 
@@ -1146,7 +1246,14 @@ function collectionProgress(cache) {
     unavailable,
     captured,
     transient,
-    remaining: years.length - available - unavailable - captured - transient
+    pendingPublication,
+    remaining:
+      years.length -
+      available -
+      unavailable -
+      captured -
+      transient -
+      pendingPublication
   }
 }
 
@@ -1178,6 +1285,9 @@ function progressMessage(cache) {
     (progress.transient
       ? `\n${countLabel(progress.transient, "report is waiting to retry", "reports are waiting to retry")}`
       : "") +
+    (progress.pendingPublication
+      ? "\nThe newest annual report is not available yet"
+      : "") +
     (progress.unavailable
       ? `\n${countLabel(progress.unavailable, "year is not available on Last.fm", "years are not available on Last.fm")}`
       : "")
@@ -1185,11 +1295,54 @@ function progressMessage(cache) {
 }
 
 
+function nextRetryMs(cache) {
+  let earliest = null
+
+  for (const year of yearsInRange(cache)) {
+    if (needsLocalParse(cache, year) || needsNetwork(cache, year)) {
+      continue
+    }
+
+    const record = cache.years?.[yearKey(year)]
+    const status = record?.status
+
+    const waiting =
+      status === "transient" ||
+      status === "pending-publication" ||
+      (status === "captured" && !hasRawReport(year))
+
+    if (!waiting) {
+      continue
+    }
+
+    const after = retryAfterMs(record)
+
+    if (after > nowMs() && (earliest == null || after < earliest)) {
+      earliest = after
+    }
+  }
+
+  return earliest
+}
+
+
+function formatRetryTime(ms) {
+  try {
+    return new Date(ms).toLocaleString()
+  } catch (_) {
+    return "later"
+  }
+}
+
+
 function idleStatus(cache) {
   const progress = collectionProgress(cache)
   const range = collectionRange(cache?.account)
   const unresolved =
-    progress.captured + progress.transient + progress.remaining
+    progress.captured +
+    progress.transient +
+    progress.pendingPublication +
+    progress.remaining
   const body = progressMessage(cache)
 
   if (range.ready && range.empty) {
@@ -1212,12 +1365,15 @@ function idleStatus(cache) {
     }
   }
 
+  const nextRetry = nextRetryMs(cache)
+  const retryLine = nextRetry
+    ? `\n\nNext check: ${formatRetryTime(nextRetry)}`
+    : "\n\nNothing more can be collected until a saved report can be read or a later retry is possible."
+
   return {
     complete: false,
     title: "Collection paused",
-    message:
-      body +
-      "\n\nNothing more can be collected until a saved report can be read or a later retry is possible."
+    message: body + retryLine
   }
 }
 
@@ -1665,8 +1821,8 @@ async function runCollector() {
         status: existing.status === "available" ? "available" : "captured",
         httpStatus: 200,
         rawSaved: true,
-        capturedAt: Date.now(),
-        lastTriedAt: Date.now(),
+        capturedAt: nowMs(),
+        lastTriedAt: nowMs(),
         source: "network-capture"
       })
 
@@ -1717,14 +1873,27 @@ async function runCollector() {
         )
       }
     } else if (result.status === 404) {
-      markUnavailable(cache, target.year, 404)
-      printCacheSummary(cache)
+      const range = collectionRange(cache.account)
 
-      await presentAlert(
-        `${target.year} not available`,
-        "Last.fm has no listening report for this year.\n\n" +
-          progressMessage(cache)
-      )
+      if (range.lastYear != null && target.year === range.lastYear) {
+        markPendingPublication(cache, target.year, 404)
+        printCacheSummary(cache)
+
+        await presentAlert(
+          `${target.year} not published yet`,
+          "The newest annual report is not available yet. It will be eligible to check again later.\n\n" +
+            progressMessage(cache)
+        )
+      } else {
+        markUnavailable(cache, target.year, 404)
+        printCacheSummary(cache)
+
+        await presentAlert(
+          `${target.year} not available`,
+          "Last.fm has no listening report for this year.\n\n" +
+            progressMessage(cache)
+        )
+      }
     } else {
       markTransient(cache, target.year, result.status)
       printCacheSummary(cache)
@@ -1768,6 +1937,9 @@ if (typeof module !== "undefined" && module.exports) {
     USER_AGENT,
     USERNAME_PLACEHOLDER,
     API_KEY_PLACEHOLDER,
+    HOUR_MS,
+    DAY_MS,
+    PENDING_PUBLICATION_RETRY_MS,
     CONFIG,
     userStorageKey,
     userDirectoryPath,
@@ -1802,7 +1974,15 @@ if (typeof module !== "undefined" && module.exports) {
     fetchUserInfo,
     fetchReport,
     setNowMs,
+    nowMs,
     currentCalendarYear,
+    delayMsForFailureCount,
+    retryAfterMs,
+    isRetryEligible,
+    nextRetryMs,
+    markTransient,
+    markPendingPublication,
+    markUnavailable,
     fnv1aHex
   }
 }
