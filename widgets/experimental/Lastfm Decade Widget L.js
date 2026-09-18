@@ -2,96 +2,47 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: deep-gray; icon-glyph: magic;
 // Last.fm Decade History Collector
-// Development version v0.5
+// Experimental development version v0.6
 //
 // SAFE / GENTLE COLLECTOR
 // ------------------------------------------------------------
 //
-// One network request maximum per execution.
+// Absolute maximum Last.fm HTTP requests per execution: 1
 //
-// Important change from v0.4:
-//   - NO custom browser headers
-//   - NO User-Agent
-//   - NO Accept headers
-//   - NO fabricated Safari request
+// v0.6 architecture:
+//   - Username-scoped local storage
+//   - Cache schema v2
+//   - Conservative import of matching v0.5/v1 cache data
+//   - Captured/unparsable years do not block other years
+//   - Chronological collection queue
 //
-// This deliberately uses Scriptable's plain Request behaviour,
-// matching the earlier requests which successfully returned
-// Last.fm annual listening reports.
+// This is still a manual Scriptable collector.
+// It does not create a Home Screen widget.
 //
-// WORKFLOW
-// ------------------------------------------------------------
-//
-// 1. Select one unresolved year.
-// 2. If HTML for that year has already been saved:
-//      -> make ZERO network requests
-//      -> parse the saved copy locally.
-// 3. Otherwise:
-//      -> request that ONE annual report.
-// 4. If HTTP 200:
-//      -> save raw HTML immediately.
-//      -> then attempt parsing.
-// 5. If parsing fails:
-//      -> keep HTML.
-//      -> future development can re-parse it locally.
-// 6. If HTTP 404:
-//      -> mark that year unavailable.
-// 7. Any other response:
-//      -> preserve everything.
-//      -> stop.
-//      -> retry on a later execution.
-//
-// Existing successful decade-history-v1.json data is retained.
+// Temporary development year bounds (CONFIG.firstYear / lastYear)
+// remain until automatic range discovery is implemented.
+
+
+const SCHEMA_VERSION = 2
+
+// Increment when parsers change so captured HTML can be reparsed once.
+const PARSER_GENERATION = 1
 
 
 const CONFIG = {
-
   username: "YOUR_LASTFM_USERNAME",
 
+  // TEMPORARY development bounds. Do not treat as Last.fm product limits.
+  // Automatic account-range discovery is intentionally not in v0.6.
   firstYear: 2006,
-
-  // Last complete annual report.
   lastYear: 2025,
 
+  cacheRootDirectory: "LastFMDecadeHistory",
+  usersDirectory: "users",
+  cacheFile: "decade-history-v2.json",
+  rawDirectory: "RawReports",
 
-  // ----------------------------------------------------------
-  // DEVELOPMENT TARGET ORDER
-  // ----------------------------------------------------------
-  //
-  // We deliberately start with years we KNOW previously
-  // returned HTTP 200.
-  //
-  // 2016 is first because it previously returned a valid
-  // annual report but our parser didn't understand its format.
-  //
-  // 2025 is already cached successfully and will normally
-  // therefore be skipped.
-
-  preferredYears: [
-    2016,
-    2017,
-    2018,
-    2019,
-    2020,
-    2022,
-    2023,
-    2024,
-    2025
-  ],
-
-
-  // ----------------------------------------------------------
-  // STORAGE
-  // ----------------------------------------------------------
-
-  cacheDirectory:
-    "LastFMDecadeHistory",
-
-  cacheFile:
-    "decade-history-v1.json",
-
-  rawDirectory:
-    "RawReports"
+  legacyCacheFile: "decade-history-v1.json"
 }
 
 
@@ -99,52 +50,126 @@ const CONFIG = {
 // FILE SYSTEM
 // ============================================================
 
-const fm =
-  FileManager.local()
+const fm = FileManager.local()
 
-const cacheDirectory =
-  fm.joinPath(
-    fm.documentsDirectory(),
-    CONFIG.cacheDirectory
-  )
+const cacheRoot = fm.joinPath(
+  fm.documentsDirectory(),
+  CONFIG.cacheRootDirectory
+)
 
-if (
-  !fm.fileExists(
-    cacheDirectory
-  )
-) {
+if (!fm.fileExists(cacheRoot)) {
+  fm.createDirectory(cacheRoot, true)
+}
 
-  fm.createDirectory(
-    cacheDirectory,
-    true
+
+function userStorageKey(username) {
+  const trimmed = String(username ?? "").trim()
+  const normalized = trimmed.normalize
+    ? trimmed.normalize("NFC")
+    : trimmed
+
+  if (!normalized) {
+    return "_empty"
+  }
+
+  let encoded = ""
+
+  for (const character of normalized) {
+    const codePoint = character.codePointAt(0)
+
+    const safe =
+      (codePoint >= 48 && codePoint <= 57) ||
+      (codePoint >= 65 && codePoint <= 90) ||
+      (codePoint >= 97 && codePoint <= 122) ||
+      character === "-" ||
+      character === "_"
+
+    if (safe) {
+      encoded += character
+    } else {
+      encoded += "~" + codePoint.toString(16).toLowerCase() + "~"
+    }
+  }
+
+  if (
+    encoded === "." ||
+    encoded === ".." ||
+    encoded.startsWith(".") ||
+    encoded.startsWith("-")
+  ) {
+    encoded = "u" + encoded
+  }
+
+  if (encoded.length > 200) {
+    encoded =
+      encoded.slice(0, 160) +
+      "~h" +
+      fnv1aHex(normalized) +
+      "~"
+  }
+
+  return encoded
+}
+
+
+function fnv1aHex(value) {
+  let hash = 2166136261
+
+  const text = String(value)
+
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+
+  return (hash >>> 0).toString(16)
+}
+
+
+function userDirectoryPath() {
+  return fm.joinPath(
+    fm.joinPath(cacheRoot, CONFIG.usersDirectory),
+    userStorageKey(CONFIG.username)
   )
 }
 
 
-const rawDirectory =
-  fm.joinPath(
-    cacheDirectory,
-    CONFIG.rawDirectory
-  )
+function ensureUserDirectories() {
+  const userDirectory = userDirectoryPath()
 
-if (
-  !fm.fileExists(
-    rawDirectory
-  )
-) {
+  if (!fm.fileExists(userDirectory)) {
+    fm.createDirectory(userDirectory, true)
+  }
 
-  fm.createDirectory(
-    rawDirectory,
-    true
-  )
+  const rawDir = fm.joinPath(userDirectory, CONFIG.rawDirectory)
+
+  if (!fm.fileExists(rawDir)) {
+    fm.createDirectory(rawDir, true)
+  }
+
+  return userDirectory
 }
 
 
-const cachePath =
-  fm.joinPath(
-    cacheDirectory,
-    CONFIG.cacheFile
-  )
+function cacheFilePath() {
+  return fm.joinPath(ensureUserDirectories(), CONFIG.cacheFile)
+}
+
+
+function rawDirectoryPath() {
+  ensureUserDirectories()
+  return fm.joinPath(userDirectoryPath(), CONFIG.rawDirectory)
+}
+
+
+function legacyCacheFilePath() {
+  return fm.joinPath(cacheRoot, CONFIG.legacyCacheFile)
+}
+
+
+function legacyRawDirectoryPath() {
+  return fm.joinPath(cacheRoot, CONFIG.rawDirectory)
+}
 
 
 // ============================================================
@@ -152,29 +177,40 @@ const cachePath =
 // ============================================================
 
 function formatNumber(value) {
+  return Number(value || 0).toLocaleString()
+}
 
-  return Number(
-    value || 0
-  ).toLocaleString()
+
+function yearKey(year) {
+  return String(year)
+}
+
+
+function yearsInRange() {
+  const years = []
+
+  for (let year = CONFIG.firstYear; year <= CONFIG.lastYear; year += 1) {
+    years.push(year)
+  }
+
+  return years
 }
 
 
 function rawPath(year) {
+  return fm.joinPath(rawDirectoryPath(), `${year}.html`)
+}
 
-  return fm.joinPath(
-    rawDirectory,
-    `${year}.html`
-  )
+
+function legacyRawPath(year) {
+  return fm.joinPath(legacyRawDirectoryPath(), `${year}.html`)
 }
 
 
 function reportURL(year) {
-
   return (
     "https://www.last.fm/user/" +
-    encodeURIComponent(
-      CONFIG.username
-    ) +
+    encodeURIComponent(CONFIG.username) +
     "/listening-report/year/" +
     year
   )
@@ -182,265 +218,52 @@ function reportURL(year) {
 
 
 function decodeHTML(value) {
-
-  return String(
-    value || ""
-  )
-
-    .replace(
-      /&amp;/g,
-      "&"
-    )
-
-    .replace(
-      /&quot;/g,
-      "\""
-    )
-
-    .replace(
-      /&#39;/g,
-      "'"
-    )
-
-    .replace(
-      /&apos;/g,
-      "'"
-    )
-
-    .replace(
-      /&lt;/g,
-      "<"
-    )
-
-    .replace(
-      /&gt;/g,
-      ">"
-    )
-
-    .replace(
-      /&nbsp;/g,
-      " "
-    )
-
+  return String(value || "")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ")
     .trim()
 }
 
 
 function stripTags(value) {
-
   return decodeHTML(
-
-    String(
-      value || ""
-    )
-
-      .replace(
-        /<script[\s\S]*?<\/script>/gi,
-        " "
-      )
-
-      .replace(
-        /<style[\s\S]*?<\/style>/gi,
-        " "
-      )
-
-      .replace(
-        /<[^>]+>/g,
-        " "
-      )
-
-      .replace(
-        /\s+/g,
-        " "
-      )
+    String(value || "")
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
   )
 }
 
 
 function escapeRegExp(value) {
-
-  return String(value)
-    .replace(
-      /[.*+?^${}()|[\]\\]/g,
-      "\\$&"
-    )
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
 
-// ============================================================
-// CACHE
-// ============================================================
-
-function createEmptyCache() {
-
-  return {
-
-    version: 1,
-
-    username:
-      CONFIG.username,
-
-    years: {},
-
-    createdAt:
-      Date.now(),
-
-    updatedAt:
-      Date.now()
-  }
-}
-
-
-function loadCache() {
-
-  if (
-    !fm.fileExists(
-      cachePath
-    )
-  ) {
-
-    return createEmptyCache()
+function copyFileIfMissing(fromPath, toPath) {
+  if (!fm.fileExists(fromPath) || fm.fileExists(toPath)) {
+    return false
   }
 
+  const parent = toPath.slice(0, toPath.lastIndexOf("/"))
 
-  try {
-
-    const cache =
-      JSON.parse(
-        fm.readString(
-          cachePath
-        )
-      )
-
-
-    if (
-      !cache ||
-      cache.username !==
-        CONFIG.username
-    ) {
-
-      console.log(
-        "Existing cache belongs to another user."
-      )
-
-      return createEmptyCache()
-    }
-
-
-    if (
-      typeof cache.years !==
-        "object"
-    ) {
-
-      cache.years = {}
-    }
-
-
-    return cache
-
-  } catch (error) {
-
-    console.log(
-      `Cache read error: ${error}`
-    )
-
-    return createEmptyCache()
-  }
-}
-
-
-function saveCache(cache) {
-
-  cache.updatedAt =
-    Date.now()
-
-
-  fm.writeString(
-    cachePath,
-    JSON.stringify(
-      cache
-    )
-  )
-}
-
-
-// ============================================================
-// RAW HTML STORAGE
-// ============================================================
-
-function hasRawReport(year) {
-
-  return fm.fileExists(
-    rawPath(year)
-  )
-}
-
-
-function loadRawReport(year) {
-
-  if (
-    !hasRawReport(year)
-  ) {
-
-    return null
+  if (parent && !fm.fileExists(parent)) {
+    fm.createDirectory(parent, true)
   }
 
-
-  try {
-
-    return fm.readString(
-      rawPath(year)
-    )
-
-  } catch (_) {
-
-    return null
+  if (typeof fm.copy === "function") {
+    fm.copy(fromPath, toPath)
+  } else {
+    fm.writeString(toPath, fm.readString(fromPath))
   }
-}
 
-
-function saveRawReport(
-  year,
-  html
-) {
-
-  // Save first.
-  //
-  // Parsing happens only AFTER this succeeds.
-
-  fm.writeString(
-    rawPath(year),
-    html
-  )
-
-
-  console.log(
-    `✓ Raw ${year} HTML saved`
-  )
-
-  console.log(
-    rawPath(year)
-  )
-}
-
-
-// ============================================================
-// PAGE TITLE
-// ============================================================
-
-function extractTitle(html) {
-
-  const match =
-    String(html).match(
-      /<title[^>]*>([\s\S]*?)<\/title>/i
-    )
-
-
-  return match
-    ? stripTags(
-        match[1]
-      )
-    : ""
+  return true
 }
 
 
@@ -449,582 +272,631 @@ function extractTitle(html) {
 // ============================================================
 
 const DECADES = [
-
-  {
-    label: "Pre-1960",
-    key: "pre-1960"
-  },
-
-  {
-    label: "1960s",
-    key: "1960s"
-  },
-
-  {
-    label: "1970s",
-    key: "1970s"
-  },
-
-  {
-    label: "1980s",
-    key: "1980s"
-  },
-
-  {
-    label: "1990s",
-    key: "1990s"
-  },
-
-  {
-    label: "2000s",
-    key: "2000s"
-  },
-
-  {
-    label: "2010s",
-    key: "2010s"
-  },
-
-  {
-    label: "2020s",
-    key: "2020s"
-  }
+  { label: "Pre-1960", key: "pre-1960" },
+  { label: "1960s", key: "1960s" },
+  { label: "1970s", key: "1970s" },
+  { label: "1980s", key: "1980s" },
+  { label: "1990s", key: "1990s" },
+  { label: "2000s", key: "2000s" },
+  { label: "2010s", key: "2010s" },
+  { label: "2020s", key: "2020s" }
 ]
 
 
 // ============================================================
-// PARSER 1
-//
-// 2025 FORMAT:
-//
-// <table class="... js-music-decade-data">
-// ...
-// <td data-decade="1960s">1960s</td>
-// <td>10</td>
-// ...
+// CACHE SCHEMA v2
 // ============================================================
 
-function parseKnownTableFormat(html) {
+function createEmptyCache() {
+  const now = Date.now()
 
-  const tableMatch =
-    String(html).match(
-      /<table[^>]*class=["'][^"']*js-music-decade-data[^"']*["'][^>]*>([\s\S]*?)<\/table>/i
-    )
+  return {
+    version: SCHEMA_VERSION,
+    username: CONFIG.username,
+    years: {},
+    createdAt: now,
+    updatedAt: now,
+    migratedFromV1: false
+  }
+}
 
 
-  if (!tableMatch) {
+function createYearRecord(year, extra = {}) {
+  return {
+    year: Number(year),
+    status: extra.status || "transient",
+    decades: extra.decades || null,
+    classified: extra.classified ?? null,
+    parser: extra.parser || null,
+    source: extra.source || null,
+    httpStatus: extra.httpStatus ?? null,
+    capturedAt: extra.capturedAt ?? null,
+    parsedAt: extra.parsedAt ?? null,
+    checkedAt: extra.checkedAt ?? null,
+    updatedAt: extra.updatedAt ?? Date.now(),
+    rawSaved: extra.rawSaved ?? false,
+    lastTriedAt: extra.lastTriedAt ?? null,
+    failureCount: extra.failureCount ?? 0,
+    lastFailureStatus: extra.lastFailureStatus ?? null,
+    parseGeneration: extra.parseGeneration ?? null,
+    ...extra,
+    year: Number(year)
+  }
+}
 
+
+function canWriteCache(cache) {
+  return cache && cache.ok !== false && !cache.integrityError
+}
+
+
+function saveCache(cache) {
+  if (!canWriteCache(cache)) {
+    return false
+  }
+
+  cache.updatedAt = Date.now()
+  cache.version = SCHEMA_VERSION
+  cache.username = CONFIG.username
+
+  const persisted = {
+    version: cache.version,
+    username: cache.username,
+    years: cache.years,
+    createdAt: cache.createdAt,
+    updatedAt: cache.updatedAt,
+    migratedFromV1: Boolean(cache.migratedFromV1)
+  }
+
+  if (cache.migratedAt) {
+    persisted.migratedAt = cache.migratedAt
+  }
+
+  fm.writeString(
+    cacheFilePath(),
+    JSON.stringify(persisted)
+  )
+
+  return true
+}
+
+
+function readJSONFile(path) {
+  if (!fm.fileExists(path)) {
+    return { exists: false, value: null, corrupt: false }
+  }
+
+  try {
+    const value = JSON.parse(fm.readString(path))
+    return { exists: true, value, corrupt: false }
+  } catch (error) {
+    return { exists: true, value: null, corrupt: true, error }
+  }
+}
+
+
+function yearStatus(cache, year) {
+  return cache.years?.[yearKey(year)]?.status || null
+}
+
+
+function isAvailable(cache, year) {
+  return yearStatus(cache, year) === "available"
+}
+
+
+function isUnavailable(cache, year) {
+  return yearStatus(cache, year) === "unavailable"
+}
+
+
+function isCaptured(cache, year) {
+  return yearStatus(cache, year) === "captured"
+}
+
+
+function hasRawReport(year) {
+  return fm.fileExists(rawPath(year))
+}
+
+
+function loadRawReport(year) {
+  if (!hasRawReport(year)) {
     return null
   }
 
+  try {
+    return fm.readString(rawPath(year))
+  } catch (_) {
+    return null
+  }
+}
 
-  const tableHTML =
-    tableMatch[1]
+
+function saveRawReport(year, html) {
+  fm.writeString(rawPath(year), html)
+
+  console.log(`Saved ${year} listening report locally.`)
+}
 
 
+// ============================================================
+// PARSERS (unchanged from v0.5)
+// ============================================================
+
+function extractTitle(html) {
+  const match = String(html).match(/<title[^>]*>([\s\S]*?)<\/title>/i)
+
+  return match ? stripTags(match[1]) : ""
+}
+
+
+function parseKnownTableFormat(html) {
+  const tableMatch = String(html).match(
+    /<table[^>]*class=["'][^"']*js-music-decade-data[^"']*["'][^>]*>([\s\S]*?)<\/table>/i
+  )
+
+  if (!tableMatch) {
+    return null
+  }
+
+  const tableHTML = tableMatch[1]
   const result = {}
 
-
-  for (
-    const decade
-    of DECADES
-  ) {
-
-    const pattern =
-      new RegExp(
-
-        "<td[^>]*data-decade=[\"']" +
-        escapeRegExp(
-          decade.key
-        ) +
+  for (const decade of DECADES) {
+    const pattern = new RegExp(
+      "<td[^>]*data-decade=[\"']" +
+        escapeRegExp(decade.key) +
         "[\"'][^>]*>" +
-
         "[\\s\\S]*?<\\/td>" +
-
         "\\s*" +
-
         "<td[^>]*>" +
         "\\s*([0-9,]+)\\s*" +
         "<\\/td>",
+      "i"
+    )
 
-        "i"
-      )
-
-
-    const match =
-      tableHTML.match(
-        pattern
-      )
-
+    const match = tableHTML.match(pattern)
 
     if (match) {
-
-      result[
-        decade.label
-      ] =
-        Number(
-          match[1]
-            .replace(
-              /,/g,
-              ""
-            )
-        )
+      result[decade.label] = Number(match[1].replace(/,/g, ""))
     }
   }
 
-
-  if (
-    Object.keys(
-      result
-    ).length === 0
-  ) {
-
+  if (Object.keys(result).length === 0) {
     return null
   }
 
-
   return {
-
-    parser:
-      "js-music-decade-data",
-
-    decades:
-      result
+    parser: "js-music-decade-data",
+    decades: result
   }
 }
 
 
-// ============================================================
-// PARSER 2
-//
-// GENERIC DATA-DECADE FORMAT
-//
-// Older report layouts may retain data-decade attributes even
-// if the surrounding table class differs.
-// ============================================================
-
-function parseGenericDataDecade(
-  html
-) {
-
-  const source =
-    String(html)
-
-
+function parseGenericDataDecade(html) {
+  const source = String(html)
   const result = {}
 
+  for (const decade of DECADES) {
+    const marker = new RegExp(
+      "data-decade=[\"']" + escapeRegExp(decade.key) + "[\"']",
+      "i"
+    )
 
-  for (
-    const decade
-    of DECADES
-  ) {
-
-    // Find data-decade marker, then inspect a conservative
-    // amount of HTML immediately following it.
-
-    const marker =
-      new RegExp(
-
-        "data-decade=[\"']" +
-        escapeRegExp(
-          decade.key
-        ) +
-        "[\"']",
-
-        "i"
-      )
-
-
-    const markerMatch =
-      marker.exec(
-        source
-      )
-
+    const markerMatch = marker.exec(source)
 
     if (!markerMatch) {
-
       continue
     }
 
+    const fragment = source.slice(markerMatch.index, markerMatch.index + 1500)
+    const numericCell = fragment.match(
+      /<\/td>\s*<td[^>]*>\s*([0-9,]+)\s*<\/td>/i
+    )
 
-    const start =
-      markerMatch.index
-
-
-    const fragment =
-      source.slice(
-        start,
-        start + 1500
-      )
-
-
-    // Prefer the first numeric TD following the decade cell.
-
-    const numericCell =
-      fragment.match(
-        /<\/td>\s*<td[^>]*>\s*([0-9,]+)\s*<\/td>/i
-      )
-
-
-    if (
-      numericCell
-    ) {
-
-      result[
-        decade.label
-      ] =
-        Number(
-          numericCell[1]
-            .replace(
-              /,/g,
-              ""
-            )
-        )
+    if (numericCell) {
+      result[decade.label] = Number(numericCell[1].replace(/,/g, ""))
     }
   }
 
-
-  if (
-    Object.keys(
-      result
-    ).length === 0
-  ) {
-
+  if (Object.keys(result).length === 0) {
     return null
   }
 
-
   return {
-
-    parser:
-      "generic-data-decade",
-
-    decades:
-      result
+    parser: "generic-data-decade",
+    decades: result
   }
 }
 
-
-// ============================================================
-// PARSER 3
-//
-// LABEL-BASED FALLBACK
-//
-// Deliberately conservative.
-//
-// We only accept this parser if ALL eight decade labels can be
-// associated with plausible nearby numbers.
-//
-// This prevents random dates/counts elsewhere on the report
-// being mistaken for decade values.
-// ============================================================
 
 function parseLabelFallback(html) {
-
-  const source =
-    String(html)
-
-
+  const source = String(html)
   const result = {}
 
-
-  for (
-    const decade
-    of DECADES
-  ) {
-
-    const labelPattern =
-      new RegExp(
-        escapeRegExp(
-          decade.label
-        ),
-        "i"
-      )
-
-
-    const match =
-      labelPattern.exec(
-        source
-      )
-
+  for (const decade of DECADES) {
+    const match = new RegExp(escapeRegExp(decade.label), "i").exec(source)
 
     if (!match) {
-
       return null
     }
 
-
-    const fragment =
-      source.slice(
-        match.index,
-        match.index + 800
-      )
-
-
-    // Look for the next table cell containing only a number.
-
-    const numberMatch =
-      fragment.match(
-        /<td[^>]*>\s*([0-9][0-9,]*)\s*<\/td>/i
-      )
-
+    const fragment = source.slice(match.index, match.index + 800)
+    const numberMatch = fragment.match(/<td[^>]*>\s*([0-9][0-9,]*)\s*<\/td>/i)
 
     if (!numberMatch) {
-
       return null
     }
 
-
-    result[
-      decade.label
-    ] =
-      Number(
-        numberMatch[1]
-          .replace(
-            /,/g,
-            ""
-          )
-      )
+    result[decade.label] = Number(numberMatch[1].replace(/,/g, ""))
   }
 
-
   return {
-
-    parser:
-      "label-fallback",
-
-    decades:
-      result
+    parser: "label-fallback",
+    decades: result
   }
 }
 
 
-// ============================================================
-// MASTER PARSER
-// ============================================================
-
 function parseDecades(html) {
-
   const parsers = [
-
     parseKnownTableFormat,
-
     parseGenericDataDecade,
-
     parseLabelFallback
   ]
 
-
-  for (
-    const parser
-    of parsers
-  ) {
-
+  for (const parser of parsers) {
     try {
+      const result = parser(html)
 
-      const result =
-        parser(html)
-
-
-      if (
-        result &&
-        result.decades
-      ) {
-
+      if (result && result.decades) {
         return result
       }
-
     } catch (error) {
-
-      console.log(
-        `Parser error: ${error}`
-      )
+      console.log(`Parser error: ${error}`)
     }
   }
-
 
   return null
 }
 
 
-// ============================================================
-// VALIDATION
-// ============================================================
-
-function validateDecades(
-  decades
-) {
-
+function validateDecades(decades) {
   if (!decades) {
+    return { valid: false, reason: "No decade data" }
+  }
 
-    return {
-      valid: false,
-      reason: "No decade data"
+  const labels = DECADES.map(item => item.label)
+
+  for (const label of labels) {
+    if (decades[label] === undefined || decades[label] === null) {
+      return { valid: false, reason: `Missing ${label}` }
+    }
+
+    const value = Number(decades[label])
+
+    if (!Number.isFinite(value) || value < 0) {
+      return { valid: false, reason: `Invalid ${label}` }
     }
   }
 
+  const total = labels.reduce(
+    (sum, label) => sum + Number(decades[label]),
+    0
+  )
 
-  const labels =
-    DECADES.map(
-      item => item.label
-    )
-
-
-  // For a full Last.fm decade report we expect all eight
-  // categories.
-
-  for (
-    const label
-    of labels
-  ) {
-
-    if (
-      decades[label] ===
-        undefined ||
-      decades[label] ===
-        null
-    ) {
-
-      return {
-        valid: false,
-        reason:
-          `Missing ${label}`
-      }
-    }
-
-
-    const value =
-      Number(
-        decades[label]
-      )
-
-
-    if (
-      !Number.isFinite(
-        value
-      ) ||
-      value < 0
-    ) {
-
-      return {
-        valid: false,
-        reason:
-          `Invalid ${label}`
-      }
-    }
+  if (total <= 0) {
+    return { valid: false, reason: "Classified total is zero" }
   }
 
-
-  const total =
-    labels.reduce(
-      (
-        sum,
-        label
-      ) =>
-        sum +
-        Number(
-          decades[label]
-        ),
-      0
-    )
-
-
-  if (
-    total <= 0
-  ) {
-
-    return {
-      valid: false,
-      reason:
-        "Classified total is zero"
-    }
-  }
-
-
-  return {
-
-    valid: true,
-
-    total
-  }
+  return { valid: true, total }
 }
 
 
 // ============================================================
-// CACHE SUCCESS
+// v1 → v2 MIGRATION
 // ============================================================
 
-function storeParsedYear(
-  cache,
-  year,
-  parsed,
-  source
-) {
+function importYearFromLegacy(cache, year, legacyYear, htmlCopied) {
+  const key = yearKey(year)
 
-  const validation =
-    validateDecades(
-      parsed.decades
-    )
-
-
-  if (
-    !validation.valid
-  ) {
-
-    throw new Error(
-      validation.reason
-    )
+  // Idempotent: never replace a year already recorded in v2.
+  if (cache.years[key]) {
+    return "kept-v2"
   }
 
+  const now = Date.now()
+  const legacyStatus = legacyYear?.status
+  const rawSaved = htmlCopied || hasRawReport(year)
 
-  const existing =
-    cache.years[
-      String(year)
-    ] || {}
+  if (legacyStatus === "available" && legacyYear?.decades) {
+    const validation = validateDecades(legacyYear.decades)
+
+    if (validation.valid) {
+      cache.years[key] = createYearRecord(year, {
+        status: "available",
+        decades: legacyYear.decades,
+        classified: validation.total,
+        parser: legacyYear.parser || null,
+        source: legacyYear.source || "v1-import",
+        httpStatus: legacyYear.httpStatus ?? 200,
+        capturedAt: legacyYear.capturedAt ?? null,
+        parsedAt: legacyYear.parsedAt ?? now,
+        checkedAt: legacyYear.checkedAt ?? null,
+        updatedAt: now,
+        rawSaved,
+        lastTriedAt: legacyYear.lastTriedAt ?? null,
+        failureCount: 0,
+        lastFailureStatus: null,
+        parseGeneration: PARSER_GENERATION
+      })
+
+      return "available"
+    }
+  }
+
+  if (legacyStatus === "unavailable") {
+    if (!cache.years[key]) {
+      cache.years[key] = createYearRecord(year, {
+        status: "unavailable",
+        httpStatus: legacyYear.httpStatus ?? 404,
+        checkedAt: legacyYear.checkedAt ?? now,
+        updatedAt: now,
+        rawSaved: false,
+        source: "v1-import"
+      })
+    }
+
+    return "unavailable"
+  }
+
+  if (rawSaved || legacyStatus === "captured") {
+    if (!cache.years[key] || cache.years[key].status !== "available") {
+      cache.years[key] = createYearRecord(year, {
+        status: "captured",
+        httpStatus: legacyYear?.httpStatus ?? 200,
+        capturedAt: legacyYear?.capturedAt ?? now,
+        updatedAt: now,
+        rawSaved,
+        source: legacyYear?.source || "v1-import",
+        parseGeneration: null
+      })
+    }
+
+    return "captured"
+  }
+
+  return "skipped"
+}
 
 
-  cache.years[
-    String(year)
-  ] = {
+function migrateMatchingLegacyCache(cache) {
+  const legacy = readJSONFile(legacyCacheFilePath())
 
+  if (!legacy.exists || legacy.corrupt || !legacy.value) {
+    return { imported: false, reason: "none" }
+  }
+
+  if (legacy.value.username !== CONFIG.username) {
+    console.log("Legacy cache belongs to another Last.fm user. Not imported.")
+    return { imported: false, reason: "username-mismatch" }
+  }
+
+  const legacyYears = legacy.value.years || {}
+  const summary = {
+    imported: false,
+    reason: "already-present",
+    available: 0,
+    captured: 0,
+    unavailable: 0,
+    htmlCopied: 0
+  }
+
+  for (const [key, legacyYear] of Object.entries(legacyYears)) {
+    const year = Number(legacyYear?.year ?? key)
+
+    if (!Number.isFinite(year)) {
+      continue
+    }
+
+    const copied = copyFileIfMissing(
+      legacyRawPath(year),
+      rawPath(year)
+    )
+
+    if (copied) {
+      summary.htmlCopied += 1
+    }
+
+    const result = importYearFromLegacy(
+      cache,
+      year,
+      legacyYear,
+      copied || hasRawReport(year)
+    )
+
+    if (result === "available") {
+      summary.available += 1
+    } else if (result === "captured") {
+      summary.captured += 1
+    } else if (result === "unavailable") {
+      summary.unavailable += 1
+    }
+  }
+
+  const changed =
+    summary.available > 0 ||
+    summary.captured > 0 ||
+    summary.unavailable > 0 ||
+    summary.htmlCopied > 0
+
+  if (!changed) {
+    return summary
+  }
+
+  cache.migratedFromV1 = true
+  cache.migratedAt = Date.now()
+  summary.imported = true
+  summary.reason = "imported"
+
+  return summary
+}
+
+
+function loadCache() {
+  const current = readJSONFile(cacheFilePath())
+
+  if (current.corrupt) {
+    console.log(`Cache read error: ${current.error}`)
+
+    return {
+      ...createEmptyCache(),
+      ok: false,
+      integrityError: "corrupt",
+      message:
+        "The saved listening history file could not be read. " +
+        "Local report files were left untouched."
+    }
+  }
+
+  if (current.exists && current.value) {
+    const cache = current.value
+
+    if (cache.username !== CONFIG.username) {
+      return {
+        ...createEmptyCache(),
+        ok: false,
+        integrityError: "username-mismatch",
+        message:
+          "Saved listening history does not match the configured Last.fm username. " +
+          "Nothing was overwritten."
+      }
+    }
+
+    if (cache.version !== SCHEMA_VERSION) {
+      return {
+        ...createEmptyCache(),
+        ok: false,
+        integrityError: "version",
+        message:
+          "Saved listening history uses an unsupported format. " +
+          "Local report files were left untouched."
+      }
+    }
+
+    if (typeof cache.years !== "object" || cache.years === null) {
+      cache.years = {}
+    }
+
+    cache.ok = true
+
+    const migration = migrateMatchingLegacyCache(cache)
+
+    if (migration.imported) {
+      saveCache(cache)
+      cache.migration = migration
+    }
+
+    return cache
+  }
+
+  const cache = createEmptyCache()
+  const migration = migrateMatchingLegacyCache(cache)
+
+  if (migration.imported) {
+    saveCache(cache)
+    cache.migration = migration
+  }
+
+  cache.ok = true
+  return cache
+}
+
+
+// ============================================================
+// STORE PARSED YEAR
+// ============================================================
+
+function storeParsedYear(cache, year, parsed, source) {
+  const validation = validateDecades(parsed.decades)
+
+  if (!validation.valid) {
+    throw new Error(validation.reason)
+  }
+
+  const existing = cache.years[yearKey(year)] || {}
+
+  cache.years[yearKey(year)] = createYearRecord(year, {
     ...existing,
-
-    year,
-
-    status:
-      "available",
-
-    httpStatus:
-      200,
-
-    parser:
-      parsed.parser,
-
-    decades:
-      parsed.decades,
-
-    classified:
-      validation.total,
-
+    status: "available",
+    httpStatus: existing.httpStatus ?? 200,
+    parser: parsed.parser,
+    decades: parsed.decades,
+    classified: validation.total,
     source,
+    rawSaved: hasRawReport(year),
+    parsedAt: Date.now(),
+    updatedAt: Date.now(),
+    parseGeneration: PARSER_GENERATION,
+    failureCount: 0,
+    lastFailureStatus: null
+  })
 
-    rawSaved:
-      hasRawReport(year),
-
-    parsedAt:
-      Date.now(),
-
-    updatedAt:
-      Date.now()
-  }
-
-
-  saveCache(
-    cache
-  )
-
+  saveCache(cache)
 
   return validation.total
+}
+
+
+function markCapturedParsePending(cache, year, extra = {}) {
+  const existing = cache.years[yearKey(year)] || {}
+
+  cache.years[yearKey(year)] = createYearRecord(year, {
+    ...existing,
+    status: "captured",
+    rawSaved: hasRawReport(year),
+    parseGeneration: PARSER_GENERATION,
+    lastTriedAt: Date.now(),
+    updatedAt: Date.now(),
+    ...extra
+  })
+
+  saveCache(cache)
+}
+
+
+function markUnavailable(cache, year, httpStatus) {
+  const existing = cache.years[yearKey(year)] || {}
+
+  cache.years[yearKey(year)] = createYearRecord(year, {
+    ...existing,
+    status: "unavailable",
+    httpStatus,
+    checkedAt: Date.now(),
+    lastTriedAt: Date.now(),
+    updatedAt: Date.now(),
+    rawSaved: false
+  })
+
+  saveCache(cache)
+}
+
+
+function markTransient(cache, year, httpStatus) {
+  const existing = cache.years[yearKey(year)] || {}
+
+  cache.years[yearKey(year)] = createYearRecord(year, {
+    ...existing,
+    status: "transient",
+    httpStatus,
+    lastTriedAt: Date.now(),
+    lastFailureStatus: httpStatus,
+    failureCount: Number(existing.failureCount || 0) + 1,
+    updatedAt: Date.now()
+  })
+
+  saveCache(cache)
 }
 
 
@@ -1032,353 +904,210 @@ function storeParsedYear(
 // LOCAL PARSE
 // ============================================================
 
-function trySavedReport(
-  cache,
-  year
-) {
-
-  const html =
-    loadRawReport(
-      year
-    )
-
+function trySavedReport(cache, year) {
+  const html = loadRawReport(year)
 
   if (!html) {
-
-    return {
-      found: false
-    }
+    // Empty or unreadable files still count as a local parse attempt
+    // so they cannot monopolise later runs. Do not download again.
+    markCapturedParsePending(cache, year)
+    return { found: false, parsed: false }
   }
 
+  console.log(`Using the saved ${year} listening report. No network request.`)
 
-  console.log(
-    ""
-  )
-
-  console.log(
-    `Raw ${year} report already exists.`
-  )
-
-  console.log(
-    "No network request will be made."
-  )
-
-
-  console.log(
-    `HTML size: ` +
-    `${formatNumber(
-      html.length
-    )} chars`
-  )
-
-
-  const parsed =
-    parseDecades(
-      html
-    )
-
+  const parsed = parseDecades(html)
 
   if (!parsed) {
-
-    console.log(
-      "Saved HTML still cannot be parsed."
-    )
-
-
-    return {
-
-      found: true,
-
-      parsed: false,
-
-      html
-    }
+    markCapturedParsePending(cache, year)
+    return { found: true, parsed: false, html }
   }
 
+  const validation = validateDecades(parsed.decades)
 
-  const validation =
-    validateDecades(
-      parsed.decades
-    )
-
-
-  if (
-    !validation.valid
-  ) {
-
-    console.log(
-      `Parser produced invalid data: ` +
-      validation.reason
-    )
-
-
-    return {
-
-      found: true,
-
-      parsed: false,
-
-      html
-    }
+  if (!validation.valid) {
+    markCapturedParsePending(cache, year)
+    return { found: true, parsed: false, html, reason: validation.reason }
   }
 
-
-  const total =
-    storeParsedYear(
-      cache,
-      year,
-      parsed,
-      "saved-html"
-    )
-
-
-  console.log(
-    `✓ Parsed locally using ` +
-    `${parsed.parser}`
-  )
-
-
-  printDecades(
-    parsed.decades
-  )
-
-
-  console.log(
-    ""
-  )
-
-  console.log(
-    `Classified: ` +
-    formatNumber(total)
-  )
-
+  const total = storeParsedYear(cache, year, parsed, "saved-html")
 
   return {
-
     found: true,
-
     parsed: true,
-
     total,
-
-    parser:
-      parsed.parser
+    parser: parsed.parser
   }
 }
 
 
 // ============================================================
 // TARGET SELECTION
+//
+// Local parse work is separate from network collection.
+// A captured year is attempted at most once per parser generation.
+// It never causes another download of that year.
+// It does not monopolise later runs after that parse attempt.
 // ============================================================
 
-function isAvailable(
-  cache,
-  year
-) {
+function needsLocalParse(cache, year) {
+  if (!hasRawReport(year)) {
+    return false
+  }
 
-  return (
-    cache.years[
-      String(year)
-    ]?.status ===
-      "available"
-  )
+  if (isAvailable(cache, year) || isUnavailable(cache, year)) {
+    return false
+  }
+
+  const record = cache.years[yearKey(year)]
+
+  if (record && record.parseGeneration === PARSER_GENERATION) {
+    return false
+  }
+
+  return true
 }
 
 
-function isUnavailable(
-  cache,
-  year
-) {
+function needsNetwork(cache, year) {
+  if (hasRawReport(year)) {
+    return false
+  }
 
-  return (
-    cache.years[
-      String(year)
-    ]?.status ===
-      "unavailable"
-  )
+  const status = yearStatus(cache, year)
+
+  if (
+    status === "available" ||
+    status === "unavailable" ||
+    status === "captured" ||
+    status === "transient"
+  ) {
+    return false
+  }
+
+  return true
 }
 
 
-function chooseTarget(
-  cache
-) {
-
-  // ----------------------------------------------------------
-  // FIRST:
-  // Any saved HTML which has not yet been successfully parsed.
-  //
-  // This costs zero network requests.
-  // ----------------------------------------------------------
-
-  for (
-    const year
-    of CONFIG.preferredYears
-  ) {
-
-    if (
-      hasRawReport(year) &&
-      !isAvailable(
-        cache,
-        year
-      )
-    ) {
-
-      return {
-
-        year,
-
-        localOnly: true
-      }
+function chooseTarget(cache) {
+  for (const year of yearsInRange()) {
+    if (needsLocalParse(cache, year)) {
+      return { year, kind: "local-parse" }
     }
   }
 
-
-  // ----------------------------------------------------------
-  // SECOND:
-  // Preferred known-report years.
-  // ----------------------------------------------------------
-
-  for (
-    const year
-    of CONFIG.preferredYears
-  ) {
-
-    if (
-      !isAvailable(
-        cache,
-        year
-      ) &&
-      !isUnavailable(
-        cache,
-        year
-      )
-    ) {
-
-      return {
-
-        year,
-
-        localOnly: false
-      }
+  for (const year of yearsInRange()) {
+    if (needsNetwork(cache, year)) {
+      return { year, kind: "network" }
     }
   }
-
-
-  // ----------------------------------------------------------
-  // THIRD:
-  // Any remaining year.
-  // ----------------------------------------------------------
-
-  for (
-    let year =
-      CONFIG.firstYear;
-
-    year <=
-      CONFIG.lastYear;
-
-    year++
-  ) {
-
-    if (
-      !isAvailable(
-        cache,
-        year
-      ) &&
-      !isUnavailable(
-        cache,
-        year
-      )
-    ) {
-
-      return {
-
-        year,
-
-        localOnly:
-          hasRawReport(
-            year
-          )
-      }
-    }
-  }
-
 
   return null
 }
 
 
-// ============================================================
-// NETWORK
-// ============================================================
+function collectionProgress(cache) {
+  const years = yearsInRange()
+  let available = 0
+  let unavailable = 0
+  let captured = 0
+  let transient = 0
 
-async function fetchReport(
-  year
-) {
+  for (const year of years) {
+    const status = yearStatus(cache, year)
 
-  const url =
-    reportURL(year)
-
-
-  console.log(
-    ""
-  )
-
-  console.log(
-    "NETWORK REQUEST"
-  )
-
-  console.log(
-    url
-  )
-
-
-  // ----------------------------------------------------------
-  // IMPORTANT
-  //
-  // Deliberately minimal Request.
-  //
-  // Do NOT add:
-  //   User-Agent
-  //   Accept
-  //   Accept-Language
-  //   Referer
-  //   Cache-Control
-  //
-  // We want Scriptable's normal request behaviour.
-  // ----------------------------------------------------------
-
-  const request =
-    new Request(url)
-
-
-  request.timeoutInterval =
-    30
-
-
-  const html =
-    await request.loadString()
-
-
-  const response =
-    request.response
-
-
-  const status =
-    Number(
-      response?.statusCode || 0
-    )
-
+    if (status === "available") {
+      available += 1
+    } else if (status === "unavailable") {
+      unavailable += 1
+    } else if (status === "captured") {
+      captured += 1
+    } else if (status === "transient") {
+      transient += 1
+    }
+  }
 
   return {
+    total: years.length,
+    available,
+    unavailable,
+    captured,
+    transient,
+    remaining: years.length - available - unavailable - captured - transient
+  }
+}
 
+
+function countLabel(count, singular, plural) {
+  return `${count} ${count === 1 ? singular : plural}`
+}
+
+
+function progressMessage(cache) {
+  const progress = collectionProgress(cache)
+
+  return (
+    `${progress.available} of ${progress.total} years collected` +
+    (progress.captured
+      ? `\n${countLabel(progress.captured, "report needs parsing", "reports need parsing")}`
+      : "") +
+    (progress.transient
+      ? `\n${countLabel(progress.transient, "report is waiting to retry", "reports are waiting to retry")}`
+      : "") +
+    (progress.unavailable
+      ? `\n${countLabel(progress.unavailable, "year is not available on Last.fm", "years are not available on Last.fm")}`
+      : "")
+  )
+}
+
+
+function idleStatus(cache) {
+  const progress = collectionProgress(cache)
+  const unresolved =
+    progress.captured + progress.transient + progress.remaining
+  const body = progressMessage(cache)
+
+  if (unresolved === 0) {
+    return {
+      complete: true,
+      title: "Listening history up to date",
+      message:
+        body +
+        "\n\nThere are no further years to collect with the current settings."
+    }
+  }
+
+  return {
+    complete: false,
+    title: "Collection paused",
+    message:
+      body +
+      "\n\nNothing more can be collected until a saved report can be read or a later retry is possible."
+  }
+}
+
+
+// ============================================================
+// NETWORK — the only Request path
+// ============================================================
+
+async function fetchReport(year) {
+  const url = reportURL(year)
+
+  console.log("NETWORK REQUEST")
+  console.log(url)
+
+  const request = new Request(url)
+  request.timeoutInterval = 30
+
+  const html = await request.loadString()
+  const status = Number(request.response?.statusCode || 0)
+
+  return {
     url,
-
     status,
-
     html,
-
-    title:
-      extractTitle(html)
+    title: extractTitle(html)
   }
 }
 
@@ -1387,364 +1116,40 @@ async function fetchReport(
 // OUTPUT
 // ============================================================
 
-function printDecades(
-  decades
-) {
+function printDecades(decades) {
+  console.log("")
 
-  console.log(
-    ""
-  )
-
-
-  for (
-    const item
-    of DECADES
-  ) {
-
-    const value =
-      Number(
-        decades[
-          item.label
-        ] || 0
-      )
-
-
-    console.log(
-      item.label
-        .padEnd(12) +
-      formatNumber(value)
-        .padStart(8)
-    )
+  for (const item of DECADES) {
+    const value = Number(decades[item.label] || 0)
+    console.log(item.label.padEnd(12) + formatNumber(value).padStart(8))
   }
 }
 
 
-function printCacheSummary(
-  cache
-) {
+function printCacheSummary(cache) {
+  const progress = collectionProgress(cache)
 
-  const available = []
-  const unavailable = []
-  const unresolved = []
-  const rawSaved = []
-
-
-  for (
-    let year =
-      CONFIG.firstYear;
-
-    year <=
-      CONFIG.lastYear;
-
-    year++
-  ) {
-
-    if (
-      hasRawReport(year)
-    ) {
-
-      rawSaved.push(
-        year
-      )
-    }
+  console.log("")
+  console.log("========================================")
+  console.log("CACHE SUMMARY")
+  console.log("========================================")
+  console.log(`User: ${CONFIG.username}`)
+  console.log(`Storage key: ${userStorageKey(CONFIG.username)}`)
+  console.log(progressMessage(cache))
+  console.log(`Remaining to collect: ${progress.remaining}`)
+}
 
 
-    const status =
-      cache.years[
-        String(year)
-      ]?.status
-
-
-    if (
-      status ===
-        "available"
-    ) {
-
-      available.push(
-        year
-      )
-
-    } else if (
-      status ===
-        "unavailable"
-    ) {
-
-      unavailable.push(
-        year
-      )
-
-    } else {
-
-      unresolved.push(
-        year
-      )
-    }
+async function presentAlert(title, message) {
+  if (typeof Alert === "undefined") {
+    console.log(`${title}: ${message}`)
+    return
   }
 
-
-  console.log(
-    ""
-  )
-
-  console.log(
-    "========================================"
-  )
-
-  console.log(
-    "CACHE SUMMARY"
-  )
-
-  console.log(
-    "========================================"
-  )
-
-
-  console.log(
-    `Parsed reports: ` +
-    (
-      available.length
-        ? available.join(", ")
-        : "None"
-    )
-  )
-
-
-  console.log(
-    `Raw HTML saved: ` +
-    (
-      rawSaved.length
-        ? rawSaved.join(", ")
-        : "None"
-    )
-  )
-
-
-  console.log(
-    `Unavailable: ` +
-    (
-      unavailable.length
-        ? unavailable.join(", ")
-        : "None"
-    )
-  )
-
-
-  console.log(
-    `Unresolved: ` +
-    (
-      unresolved.length
-        ? unresolved.join(", ")
-        : "None"
-    )
-  )
-}
-
-
-// ============================================================
-// ALERTS
-// ============================================================
-
-async function showLocalSuccess(
-  year,
-  result
-) {
-
-  const alert =
-    new Alert()
-
-
-  alert.title =
-    `${year} Parsed Locally`
-
-
-  alert.message =
-
-    `${formatNumber(
-      result.total
-    )} scrobbles classified.\n\n` +
-
-    `Parser: ${result.parser}\n\n` +
-
-    "No Last.fm network request was made."
-
-
-  alert.addAction(
-    "OK"
-  )
-
-
-  await alert.present()
-}
-
-
-async function showSavedButUnparsed(
-  year
-) {
-
-  const alert =
-    new Alert()
-
-
-  alert.title =
-    `${year} Saved Locally`
-
-
-  alert.message =
-
-    "The raw Last.fm report is safely cached, " +
-    "but the current parser still cannot extract " +
-    "its Music by Decade data.\n\n" +
-
-    "No network request was made.\n\n" +
-
-    "We can now improve the parser entirely offline."
-
-
-  alert.addAction(
-    "OK"
-  )
-
-
-  await alert.present()
-}
-
-
-async function showNetworkSuccess(
-  year,
-  total,
-  parser
-) {
-
-  const alert =
-    new Alert()
-
-
-  alert.title =
-    `${year} Report Captured`
-
-
-  alert.message =
-
-    `HTTP 200\n\n` +
-
-    `Raw HTML saved permanently.\n\n` +
-
-    `${formatNumber(
-      total
-    )} scrobbles classified.\n\n` +
-
-    `Parser: ${parser}\n\n` +
-
-    "Exactly one Last.fm request was made."
-
-
-  alert.addAction(
-    "OK"
-  )
-
-
-  await alert.present()
-}
-
-
-async function showCapturedUnparsed(
-  year
-) {
-
-  const alert =
-    new Alert()
-
-
-  alert.title =
-    `${year} Report Captured`
-
-
-  alert.message =
-
-    "HTTP 200\n\n" +
-
-    "The complete report HTML has been saved locally, " +
-    "but its decade format is different from the current parser.\n\n" +
-
-    "Do NOT keep requesting this year. " +
-    "We can now analyse the saved page locally."
-
-
-  alert.addAction(
-    "OK"
-  )
-
-
-  await alert.present()
-}
-
-
-async function showUnavailable(
-  year
-) {
-
-  const alert =
-    new Alert()
-
-
-  alert.title =
-    `${year} Report Unavailable`
-
-
-  alert.message =
-
-    "Last.fm returned HTTP 404.\n\n" +
-
-    "This year has been marked unavailable.\n\n" +
-
-    "Exactly one request was made."
-
-
-  alert.addAction(
-    "OK"
-  )
-
-
-  await alert.present()
-}
-
-
-async function showTransient(
-  year,
-  status,
-  title
-) {
-
-  const alert =
-    new Alert()
-
-
-  alert.title =
-    "Transient Last.fm Response"
-
-
-  alert.message =
-
-    `${year} returned HTTP ${status}.` +
-
-    (
-      title
-        ? `\n${title}`
-        : ""
-    ) +
-
-    "\n\nNothing has been discarded. " +
-
-    "No further requests were made.\n\n" +
-
-    "Leave it for a while before running again."
-
-
-  alert.addAction(
-    "OK"
-  )
-
-
+  const alert = new Alert()
+  alert.title = title
+  alert.message = message
+  alert.addAction("OK")
   await alert.present()
 }
 
@@ -1753,497 +1158,217 @@ async function showTransient(
 // MAIN
 // ============================================================
 
-const cache =
-  loadCache()
+async function runCollector() {
+  const cache = loadCache()
 
+  console.log("")
+  console.log("========================================")
+  console.log("LAST.FM DECADE COLLECTOR v0.6")
+  console.log("========================================")
+  console.log(`User: ${CONFIG.username}`)
+  console.log("Maximum network requests this run: 1")
 
-console.log(
-  ""
-)
+  if (cache.ok === false) {
+    await presentAlert("Listening history problem", cache.message)
+    if (typeof Script !== "undefined") {
+      Script.complete()
+    }
+    return cache
+  }
 
-console.log(
-  "========================================"
-)
+  if (cache.migration?.imported) {
+    console.log("Imported matching previous collector data.")
+  }
 
-console.log(
-  "LAST.FM DECADE COLLECTOR v0.5"
-)
+  printCacheSummary(cache)
 
-console.log(
-  "========================================"
-)
+  const target = chooseTarget(cache)
 
-console.log(
-  `User: ${CONFIG.username}`
-)
+  if (!target) {
+    const idle = idleStatus(cache)
 
-console.log(
-  "Maximum network requests this run: 1"
-)
+    await presentAlert(idle.title, idle.message)
 
+    if (typeof Script !== "undefined") {
+      Script.complete()
+    }
 
-printCacheSummary(
-  cache
-)
+    return cache
+  }
 
+  console.log(`Target year: ${target.year} (${target.kind})`)
 
-const target =
-  chooseTarget(
-    cache
-  )
+  if (target.kind === "local-parse") {
+    const local = trySavedReport(cache, target.year)
 
+    if (!local.parsed) {
+      markCapturedParsePending(cache, target.year)
+    }
 
-if (!target) {
+    printCacheSummary(cache)
 
-  console.log(
-    ""
-  )
-
-  console.log(
-    "No unresolved years remain."
-  )
-
-
-  const alert =
-    new Alert()
-
-
-  alert.title =
-    "Decade Collection Complete"
-
-
-  alert.message =
-    "There are no unresolved annual reports."
-
-
-  alert.addAction(
-    "OK"
-  )
-
-
-  await alert.present()
-
-
-  Script.complete()
-
-} else {
-
-  console.log(
-    ""
-  )
-
-  console.log(
-    `Target year: ${target.year}`
-  )
-
-
-  // ==========================================================
-  // LOCAL-FIRST
-  // ==========================================================
-
-  const local =
-    trySavedReport(
-      cache,
-      target.year
-    )
-
-
-  if (
-    local.found
-  ) {
-
-    printCacheSummary(
-      cache
-    )
-
-
-    if (
-      local.parsed
-    ) {
-
-      await showLocalSuccess(
-        target.year,
-        local
+    if (local.parsed) {
+      await presentAlert(
+        `${target.year} added from saved report`,
+        `${formatNumber(local.total)} scrobbles classified.\n\n` +
+          progressMessage(cache) +
+          "\n\nNo Last.fm request was made."
       )
-
     } else {
-
-      await showSavedButUnparsed(
-        target.year
+      await presentAlert(
+        `${target.year} saved but not yet readable`,
+        "The report is stored on this device, but its decade table could not be read yet.\n\n" +
+          "It will not block collection of other years.\n\n" +
+          progressMessage(cache)
       )
     }
 
+    if (typeof Script !== "undefined") {
+      Script.complete()
+    }
 
-    Script.complete()
+    return cache
+  }
 
-  } else {
+  try {
+    const result = await fetchReport(target.year)
 
-    // ========================================================
-    // EXACTLY ONE NETWORK REQUEST
-    // ========================================================
+    console.log(`HTTP ${result.status}`)
 
-    try {
+    if (result.status === 200) {
+      saveRawReport(target.year, result.html)
 
-      const result =
-        await fetchReport(
-          target.year
-        )
+      const existing = cache.years[yearKey(target.year)] || {}
 
+      cache.years[yearKey(target.year)] = createYearRecord(target.year, {
+        ...existing,
+        status: existing.status === "available" ? "available" : "captured",
+        httpStatus: 200,
+        rawSaved: true,
+        capturedAt: Date.now(),
+        lastTriedAt: Date.now(),
+        source: "network-capture"
+      })
 
-      console.log(
-        ""
-      )
+      saveCache(cache)
 
-      console.log(
-        `HTTP ${result.status}`
-      )
+      const parsed = parseDecades(result.html)
 
-      console.log(
-        `Title: ${result.title || "(none)"}`
-      )
+      if (parsed) {
+        const validation = validateDecades(parsed.decades)
 
-      console.log(
-        `HTML size: ` +
-        `${formatNumber(
-          result.html?.length || 0
-        )} chars`
-      )
-
-
-      // ======================================================
-      // HTTP 200
-      // ======================================================
-
-      if (
-        result.status === 200
-      ) {
-
-        // ----------------------------------------------------
-        // SAVE BEFORE PARSING
-        // ----------------------------------------------------
-
-        saveRawReport(
-          target.year,
-          result.html
-        )
-
-
-        // Record capture immediately.
-
-        const existing =
-          cache.years[
-            String(
-              target.year
-            )
-          ] || {}
-
-
-        cache.years[
-          String(
-            target.year
-          )
-        ] = {
-
-          ...existing,
-
-          year:
+        if (validation.valid) {
+          const total = storeParsedYear(
+            cache,
             target.year,
-
-          httpStatus:
-            200,
-
-          rawSaved:
-            true,
-
-          capturedAt:
-            Date.now(),
-
-          status:
-            existing.status ===
-              "available"
-              ? "available"
-              : "captured"
-        }
-
-
-        saveCache(
-          cache
-        )
-
-
-        console.log(
-          ""
-        )
-
-        console.log(
-          "Raw page safely persisted."
-        )
-
-
-        const parsed =
-          parseDecades(
-            result.html
+            parsed,
+            "network-capture"
           )
 
+          printDecades(parsed.decades)
+          printCacheSummary(cache)
 
-        if (parsed) {
-
-          const validation =
-            validateDecades(
-              parsed.decades
-            )
-
-
-          if (
-            validation.valid
-          ) {
-
-            const total =
-              storeParsedYear(
-                cache,
-                target.year,
-                parsed,
-                "network-capture"
-              )
-
-
-            console.log(
-              ""
-            )
-
-            console.log(
-              `✓ Parser: ${parsed.parser}`
-            )
-
-
-            printDecades(
-              parsed.decades
-            )
-
-
-            console.log(
-              ""
-            )
-
-            console.log(
-              `Classified: ` +
-              formatNumber(total)
-            )
-
-
-            printCacheSummary(
-              cache
-            )
-
-
-            await showNetworkSuccess(
-              target.year,
-              total,
-              parsed.parser
-            )
-
-          } else {
-
-            console.log(
-              ""
-            )
-
-            console.log(
-              "Parser output failed validation:"
-            )
-
-            console.log(
-              validation.reason
-            )
-
-
-            printCacheSummary(
-              cache
-            )
-
-
-            await showCapturedUnparsed(
-              target.year
-            )
-          }
-
+          await presentAlert(
+            `${target.year} collected`,
+            `${formatNumber(total)} scrobbles classified.\n\n` +
+              progressMessage(cache) +
+              "\n\nOne Last.fm request was made."
+          )
         } else {
+          markCapturedParsePending(cache, target.year)
+          printCacheSummary(cache)
 
-          console.log(
-            ""
-          )
-
-          console.log(
-            "No current parser matched this report."
-          )
-
-          console.log(
-            ""
-          )
-
-          console.log(
-            "THIS IS SAFE:"
-          )
-
-          console.log(
-            "The complete HTTP 200 response is now cached."
-          )
-
-          console.log(
-            "Future parser work requires no further request " +
-            `for ${target.year}.`
-          )
-
-
-          printCacheSummary(
-            cache
-          )
-
-
-          await showCapturedUnparsed(
-            target.year
+          await presentAlert(
+            `${target.year} saved`,
+            "The report was downloaded, but its decade table could not be read yet.\n\n" +
+              "Other years can still be collected.\n\n" +
+              progressMessage(cache)
           )
         }
-
-
-      // ======================================================
-      // HTTP 404
-      // ======================================================
-
-      } else if (
-        result.status === 404
-      ) {
-
-        const existing =
-          cache.years[
-            String(
-              target.year
-            )
-          ] || {}
-
-
-        cache.years[
-          String(
-            target.year
-          )
-        ] = {
-
-          ...existing,
-
-          year:
-            target.year,
-
-          status:
-            "unavailable",
-
-          httpStatus:
-            404,
-
-          checkedAt:
-            Date.now()
-        }
-
-
-        saveCache(
-          cache
-        )
-
-
-        console.log(
-          "Marked as genuinely unavailable."
-        )
-
-
-        printCacheSummary(
-          cache
-        )
-
-
-        await showUnavailable(
-          target.year
-        )
-
-
-      // ======================================================
-      // EVERYTHING ELSE
-      // ======================================================
-
       } else {
+        markCapturedParsePending(cache, target.year)
+        printCacheSummary(cache)
 
-        console.log(
-          ""
-        )
-
-        console.log(
-          "Transient / rejected response."
-        )
-
-        console.log(
-          "Cache has NOT been changed."
-        )
-
-        console.log(
-          "No further request will be made."
-        )
-
-
-        await showTransient(
-          target.year,
-          result.status,
-          result.title
+        await presentAlert(
+          `${target.year} saved`,
+          "The report was downloaded, but its decade table could not be read yet.\n\n" +
+            "Other years can still be collected.\n\n" +
+            progressMessage(cache)
         )
       }
+    } else if (result.status === 404) {
+      markUnavailable(cache, target.year, 404)
+      printCacheSummary(cache)
 
-
-    } catch (error) {
-
-      console.log(
-        ""
+      await presentAlert(
+        `${target.year} not available`,
+        "Last.fm has no listening report for this year.\n\n" +
+          progressMessage(cache)
       )
+    } else {
+      markTransient(cache, target.year, result.status)
+      printCacheSummary(cache)
 
-      console.log(
-        "NETWORK ERROR"
+      await presentAlert(
+        "Last.fm is busy",
+        `${target.year} could not be collected (HTTP ${result.status}).\n\n` +
+          "Nothing already saved was changed. Try again later.\n\n" +
+          progressMessage(cache)
       )
-
-      console.log(
-        String(
-          error?.message ||
-          error
-        )
-      )
-
-
-      const alert =
-        new Alert()
-
-
-      alert.title =
-        "Last.fm Request Failed"
-
-
-      alert.message =
-
-        `${target.year} could not be retrieved.\n\n` +
-
-        String(
-          error?.message ||
-          error
-        ) +
-
-        "\n\nNothing has been discarded. " +
-
-        "No further requests were made."
-
-
-      alert.addAction(
-        "OK"
-      )
-
-
-      await alert.present()
     }
+  } catch (error) {
+    markTransient(cache, target.year, 0)
 
+    await presentAlert(
+      "Last.fm request failed",
+      `${target.year} could not be retrieved.\n\n` +
+        String(error?.message || error) +
+        "\n\nNothing already saved was discarded."
+    )
+  }
 
+  if (typeof Script !== "undefined") {
     Script.complete()
+  }
+
+  return cache
+}
+
+
+if (typeof Script !== "undefined") {
+  await runCollector()
+}
+
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    SCHEMA_VERSION,
+    PARSER_GENERATION,
+    CONFIG,
+    userStorageKey,
+    userDirectoryPath,
+    cacheFilePath,
+    rawPath,
+    legacyCacheFilePath,
+    legacyRawPath,
+    createEmptyCache,
+    createYearRecord,
+    validateDecades,
+    parseDecades,
+    chooseTarget,
+    needsLocalParse,
+    needsNetwork,
+    yearsInRange,
+    collectionProgress,
+    progressMessage,
+    idleStatus,
+    importYearFromLegacy,
+    migrateMatchingLegacyCache,
+    loadCache,
+    saveCache,
+    trySavedReport,
+    markCapturedParsePending,
+    runCollector,
+    fnv1aHex
   }
 }
