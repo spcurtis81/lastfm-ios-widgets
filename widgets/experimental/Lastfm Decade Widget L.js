@@ -24,6 +24,7 @@
 //   unavailable          — historical year confirmed missing (404)
 //   transient            — transport/temporary failure; backoff applies
 //   pending-publication  — newest completed year returned 404; 7-day retry
+//   access-restricted    — HTTP 200 annual-report shell with report withheld
 //
 // user.getInfo and annual-report HTML are mutually exclusive:
 // a setup run may look up the account, or a later run may fetch
@@ -570,6 +571,11 @@ function isCaptured(cache, year) {
 }
 
 
+function isAccessRestricted(cache, year) {
+  return yearStatus(cache, year) === "access-restricted"
+}
+
+
 function hasRawReport(year) {
   return fm.fileExists(rawPath(year))
 }
@@ -592,6 +598,67 @@ function saveRawReport(year, html) {
   fm.writeString(rawPath(year), html)
 
   console.log(`Saved ${year} listening report locally.`)
+}
+
+
+function removeRawReport(year) {
+  const path = rawPath(year)
+
+  if (!fm.fileExists(path)) {
+    return false
+  }
+
+  try {
+    if (typeof fm.remove === "function") {
+      fm.remove(path)
+    }
+  } catch (_) {}
+
+  return true
+}
+
+
+// ============================================================
+// ACCESS-RESTRICTED ANNUAL REPORT
+//
+// HTTP 200 on the annual-report route is not enough. Last.fm
+// may return the report shell with the report body replaced by
+// a no-data upsell. That is not a parser failure.
+// ============================================================
+
+function hasClassToken(html, token) {
+  const escaped = escapeRegExp(token)
+
+  return new RegExp(
+    `class=["'][^"']*\\b${escaped}\\b[^"']*["']`,
+    "i"
+  ).test(String(html))
+}
+
+
+function isAnnualReportShell(html) {
+  const source = String(html || "")
+
+  if (hasClassToken(source, "namespace--user_listening-report_year")) {
+    return true
+  }
+
+  return /\/listening-report\/year(?:\/|"|'|\s|$)/i.test(source)
+}
+
+
+function isAccessRestrictedReport(html) {
+  const source = String(html || "")
+
+  if (!source) {
+    return false
+  }
+
+  return (
+    isAnnualReportShell(source) &&
+    hasClassToken(source, "user-dashboard-nodata") &&
+    hasClassToken(source, "user-dashboard-upsell-module")
+  )
 }
 
 
@@ -1098,6 +1165,27 @@ function markPendingPublication(cache, year, httpStatus) {
 }
 
 
+function markAccessRestricted(cache, year, extra = {}) {
+  const existing = cache.years[yearKey(year)] || {}
+
+  cache.years[yearKey(year)] = createYearRecord(year, {
+    ...existing,
+    httpStatus: extra.httpStatus ?? existing.httpStatus ?? 200,
+    checkedAt: nowMs(),
+    lastTriedAt: nowMs(),
+    updatedAt: nowMs(),
+    lastFailureStatus: null,
+    parseGeneration: null,
+    ...extra,
+    status: "access-restricted",
+    rawSaved: false
+  })
+
+  removeRawReport(year)
+  saveCache(cache)
+}
+
+
 // ============================================================
 // LOCAL PARSE
 // ============================================================
@@ -1113,6 +1201,14 @@ function trySavedReport(cache, year) {
   }
 
   console.log(`Using the saved ${year} listening report. No network request.`)
+
+  if (isAccessRestrictedReport(html)) {
+    markAccessRestricted(cache, year, {
+      httpStatus: 200,
+      source: "saved-html"
+    })
+    return { found: true, parsed: false, accessRestricted: true }
+  }
 
   const parsed = parseDecades(html)
 
@@ -1142,12 +1238,15 @@ function trySavedReport(cache, year) {
 // ============================================================
 // TARGET SELECTION
 //
-// 1. Local parse: saved HTML not yet attempted in this parser generation.
+// 1. Local work: saved HTML that is access-restricted, or not
+//    yet attempted in this parser generation.
 // 2. Network, chronological, skipping cooling-down years:
 //      missing years
 //      transient whose backoff has elapsed
 //      captured with genuinely missing HTML whose backoff has elapsed
 //      pending-publication whose 7-day wait has elapsed
+// access-restricted years are skipped. They do not retry
+// automatically and never block later years.
 // A cooling-down earlier year never blocks a later eligible year.
 // Existing local HTML is never re-downloaded.
 // ============================================================
@@ -1157,8 +1256,18 @@ function needsLocalParse(cache, year) {
     return false
   }
 
-  if (isAvailable(cache, year) || isUnavailable(cache, year)) {
+  if (
+    isAvailable(cache, year) ||
+    isUnavailable(cache, year) ||
+    isAccessRestricted(cache, year)
+  ) {
     return false
+  }
+
+  const html = loadRawReport(year)
+
+  if (html && isAccessRestrictedReport(html)) {
+    return true
   }
 
   const record = cache.years[yearKey(year)]
@@ -1179,7 +1288,11 @@ function needsNetwork(cache, year) {
   const status = yearStatus(cache, year)
   const record = cache.years?.[yearKey(year)]
 
-  if (status === "available" || status === "unavailable") {
+  if (
+    status === "available" ||
+    status === "unavailable" ||
+    status === "access-restricted"
+  ) {
     return false
   }
 
@@ -1219,6 +1332,7 @@ function collectionProgress(cache) {
   let captured = 0
   let transient = 0
   let pendingPublication = 0
+  let accessRestricted = 0
 
   for (const year of years) {
     const status = yearStatus(cache, year)
@@ -1227,6 +1341,8 @@ function collectionProgress(cache) {
       available += 1
     } else if (status === "unavailable") {
       unavailable += 1
+    } else if (status === "access-restricted") {
+      accessRestricted += 1
     } else if (status === "captured") {
       if (hasRawReport(year)) {
         captured += 1
@@ -1247,13 +1363,15 @@ function collectionProgress(cache) {
     captured,
     transient,
     pendingPublication,
+    accessRestricted,
     remaining:
       years.length -
       available -
       unavailable -
       captured -
       transient -
-      pendingPublication
+      pendingPublication -
+      accessRestricted
   }
 }
 
@@ -1290,6 +1408,9 @@ function progressMessage(cache) {
       : "") +
     (progress.unavailable
       ? `\n${countLabel(progress.unavailable, "year is not available on Last.fm", "years are not available on Last.fm")}`
+      : "") +
+    (progress.accessRestricted
+      ? `\n${countLabel(progress.accessRestricted, "report was not included because access was restricted", "reports were not included because access was restricted")}`
       : "")
   )
 }
@@ -1356,6 +1477,14 @@ function idleStatus(cache) {
   }
 
   if (unresolved === 0) {
+    if (progress.accessRestricted > 0) {
+      return {
+        complete: true,
+        title: "Collection complete",
+        message: body
+      }
+    }
+
     return {
       complete: true,
       title: "Listening history up to date",
@@ -1777,13 +1906,21 @@ async function runCollector() {
   if (target.kind === "local-parse") {
     const local = trySavedReport(cache, target.year)
 
-    if (!local.parsed) {
+    if (!local.parsed && !local.accessRestricted) {
       markCapturedParsePending(cache, target.year)
     }
 
     printCacheSummary(cache)
 
-    if (local.parsed) {
+    if (local.accessRestricted) {
+      await presentAlert(
+        `${target.year} not included`,
+        "Last.fm did not include this year's report because access was restricted.\n\n" +
+          "It will not block collection of other years.\n\n" +
+          progressMessage(cache) +
+          "\n\nNo Last.fm request was made."
+      )
+    } else if (local.parsed) {
       await presentAlert(
         `${target.year} added from saved report`,
         `${formatNumber(local.total)} scrobbles classified.\n\n` +
@@ -1812,44 +1949,69 @@ async function runCollector() {
     console.log(`HTTP ${result.status}`)
 
     if (result.status === 200) {
-      saveRawReport(target.year, result.html)
+      if (isAccessRestrictedReport(result.html)) {
+        markAccessRestricted(cache, target.year, {
+          httpStatus: 200,
+          source: "network-capture"
+        })
+        printCacheSummary(cache)
 
-      const existing = cache.years[yearKey(target.year)] || {}
+        await presentAlert(
+          `${target.year} not included`,
+          "Last.fm did not include this year's report because access was restricted.\n\n" +
+            "Other years can still be collected.\n\n" +
+            progressMessage(cache)
+        )
+      } else {
+        saveRawReport(target.year, result.html)
 
-      cache.years[yearKey(target.year)] = createYearRecord(target.year, {
-        ...existing,
-        status: existing.status === "available" ? "available" : "captured",
-        httpStatus: 200,
-        rawSaved: true,
-        capturedAt: nowMs(),
-        lastTriedAt: nowMs(),
-        source: "network-capture"
-      })
+        const existing = cache.years[yearKey(target.year)] || {}
 
-      saveCache(cache)
+        cache.years[yearKey(target.year)] = createYearRecord(target.year, {
+          ...existing,
+          status: existing.status === "available" ? "available" : "captured",
+          httpStatus: 200,
+          rawSaved: true,
+          capturedAt: nowMs(),
+          lastTriedAt: nowMs(),
+          source: "network-capture"
+        })
 
-      const parsed = parseDecades(result.html)
+        saveCache(cache)
 
-      if (parsed) {
-        const validation = validateDecades(parsed.decades)
+        const parsed = parseDecades(result.html)
 
-        if (validation.valid) {
-          const total = storeParsedYear(
-            cache,
-            target.year,
-            parsed,
-            "network-capture"
-          )
+        if (parsed) {
+          const validation = validateDecades(parsed.decades)
 
-          printDecades(parsed.decades)
-          printCacheSummary(cache)
+          if (validation.valid) {
+            const total = storeParsedYear(
+              cache,
+              target.year,
+              parsed,
+              "network-capture"
+            )
 
-          await presentAlert(
-            `${target.year} collected`,
-            `${formatNumber(total)} scrobbles classified.\n\n` +
-              progressMessage(cache) +
-              "\n\nOne Last.fm request was made."
-          )
+            printDecades(parsed.decades)
+            printCacheSummary(cache)
+
+            await presentAlert(
+              `${target.year} collected`,
+              `${formatNumber(total)} scrobbles classified.\n\n` +
+                progressMessage(cache) +
+                "\n\nOne Last.fm request was made."
+            )
+          } else {
+            markCapturedParsePending(cache, target.year)
+            printCacheSummary(cache)
+
+            await presentAlert(
+              `${target.year} saved`,
+              "The report was downloaded, but its decade table could not be read yet.\n\n" +
+                "Other years can still be collected.\n\n" +
+                progressMessage(cache)
+            )
+          }
         } else {
           markCapturedParsePending(cache, target.year)
           printCacheSummary(cache)
@@ -1861,16 +2023,6 @@ async function runCollector() {
               progressMessage(cache)
           )
         }
-      } else {
-        markCapturedParsePending(cache, target.year)
-        printCacheSummary(cache)
-
-        await presentAlert(
-          `${target.year} saved`,
-          "The report was downloaded, but its decade table could not be read yet.\n\n" +
-            "Other years can still be collected.\n\n" +
-            progressMessage(cache)
-        )
       }
     } else if (result.status === 404) {
       const range = collectionRange(cache.account)
@@ -1983,6 +2135,9 @@ if (typeof module !== "undefined" && module.exports) {
     markTransient,
     markPendingPublication,
     markUnavailable,
+    markAccessRestricted,
+    isAccessRestrictedReport,
+    isAccessRestricted,
     fnv1aHex
   }
 }
