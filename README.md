@@ -160,7 +160,7 @@ Scriptable and iOS WidgetKit decide when Home Screen widgets actually refresh. R
 
 ## Configuration
 
-Each widget needs your own Last.fm username and API key. The copies in this repository use placeholders, not the maintainer’s account.
+The stable widgets use your Last.fm username and API key. Experimental tools may have different requirements; check the notes for those scripts. The copies in this repository use placeholders, not the maintainer’s account.
 
 ```javascript
 const CONFIG = {
